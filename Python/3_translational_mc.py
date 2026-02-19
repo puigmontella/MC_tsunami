@@ -90,30 +90,35 @@ def ru_translational_grilli(rng, beta_deg, phi_deg, eps=0.5):
 
 def fs_translational(beta, phi, s_spec, Ru, k):
     """
-    Eq. (7):
-    FS = ((s-1)(1-Ru) - k s tan(beta)) / ((s-1) tan(beta) + k s tan(phi))
+    Grilli translational infinite-slope pseudo-static FS (Eq. 7 form consistent with checker):
+    FS = tan(phi) * [ (s-1)(1-Ru) - k*s*tan(beta) ] / [ (s-1)*tan(beta) + k*s ]
     """
     tb = np.tan(beta)
     tp = np.tan(phi)
-    num = (s_spec - 1.0) * (1.0 - Ru) - k * s_spec * tb
-    den = (s_spec - 1.0) * tb + k * s_spec * tp
+    num = tp * ((s_spec - 1.0) * (1.0 - Ru) - k * s_spec * tb)
+    den = (s_spec - 1.0) * tb + k * s_spec
     if den == 0:
         return np.nan
     return float(num / den)
 
+
 def kcrit_from_fs1(beta, phi, s_spec, Ru):
     """
-    Solve Eq. (7) for k when FS=1:
-      (s-1)(1-Ru) - k s tanb = (s-1)tanb + k s tanp
-      k = (s-1)*((1-Ru) - tanb) / ( s*(tanb + tanp) )
+    Solve FS=1 for k using the FS definition above.
+
+    From:
+      1 = tan(phi)*[(s-1)(1-Ru) - k*s*tan(beta)] / [(s-1)*tan(beta) + k*s]
+
+    => k = (s-1)[ tan(phi)*(1-Ru) - tan(beta) ] / [ s( tan(phi)*tan(beta) + 1 ) ]
     """
     tb = np.tan(beta)
     tp = np.tan(phi)
-    denom = s_spec * (tb + tp)
-    if denom <= 0:
+    den = s_spec * (tp * tb + 1.0)
+    if den == 0:
         return np.nan
-    k = (s_spec - 1.0) * ((1.0 - Ru) - tb) / denom
+    k = (s_spec - 1.0) * (tp * (1.0 - Ru) - tb) / den
     return float(k)
+
 
 def width_translational_grilli(rng, L):
     """

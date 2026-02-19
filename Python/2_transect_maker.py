@@ -14,13 +14,13 @@ from scipy.ndimage import gaussian_filter
 # -------------------------
 # INPUTS (edit)
 # -------------------------
-DEPTH_TIF = "../bati_32m_and100m_merged_EPSG32628.tif"
-COAST_VEC = "../contourTenerife_V2.shp"   # almost-closed polyline around Tenerife (CLOCKWISE)
+DEPTH_TIF = "../../MC_tsunami_out/bati_32m_and100m_merged_EPSG32628.tif"
+COAST_VEC = "../contourTenerife_v2.shp"   # almost-closed polyline around Tenerife (CLOCKWISE)
 
 # Raw rasters
 SLOPE_TIF_RAW = "slope_deg.tif"
 ROUGH_TIF = "roughness_std.tif"
-CLS_TIF   = "substrate_proxy_class.tif"   # 0 sed, 1 rock, 2 unk, nodata=3 (or 255)
+CLS_TIF   = "substrate_proxy_class.tif"   # 0 sed, 1 rock, 2 unk, nodata=3 
 
 plotFlag = True
 
@@ -40,9 +40,9 @@ DEPTH_LIMIT = -2500
 # Slope smoothing controls
 # -------------------------
 MAKE_SMOOTH_SLOPE = True
-SMOOTH_M = 120.0  # smoothing length in meters (try 80–150 m)
+SMOOTH_M = 200.0  # smoothing length in meters (try 80–150 m)
 SLOPE_TIF_SMOOTH = f"slope_deg_smooth_{int(SMOOTH_M)}m.tif"
-OVERWRITE_SMOOTH = False
+OVERWRITE_SMOOTH = True
 
 # -------------------------
 # Helpers
@@ -276,7 +276,22 @@ if plotFlag:
         nx, ny = float(r.nx), float(r.ny)
         L = (float(r.npoints) - 1.0) * DS_M
         x1, y1 = x0 + nx * L, y0 + ny * L
+
+        # draw transect line
         plt.plot([x0, x1], [y0, y1], linewidth=1)
+
+        # label it (slightly offshore so labels don't sit on the coastline)
+        lab_off = 150.0  # meters along transect; adjust (0–300) if you want
+        xl = x0 + nx * lab_off
+        yl = y0 + ny * lab_off
+
+        plt.text(
+            xl, yl, f"{int(r.id)}",
+            fontsize=10, color="k",
+            ha="center", va="center",
+            bbox=dict(boxstyle="round,pad=0.15", facecolor="white", edgecolor="none", alpha=0.7)
+        )
+
 
     plt.title("Transects over bathymetry")
     plt.xlabel("Easting (m)")

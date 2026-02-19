@@ -74,7 +74,7 @@ def laplacian(bathy, dx, dy):
 # -----------------------------
 # Inputs (edit these)
 # -----------------------------
-BATHY_TIF = "../bati_32m_and100m_merged_EPSG32628.tif"
+BATHY_TIF = "../../MC_tsunami_out/bati_32m_and100m_merged_EPSG32628.tif"
 
 # OPTIONAL (recommended): a raster aligned to bathy with labels where EMODnet exists
 # e.g., rock=1, sand=2, or similar. Leave as None to use Mode B.
