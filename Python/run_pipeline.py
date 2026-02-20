@@ -147,7 +147,6 @@ def main():
 
     # 7) sample PGA + compute Pf / eta tails -> summary CSV
     steps[7] = [py, script("5_loading_PGA.py"), "--config", cfg_path, "--n-jobs", str(args.n_jobs)]
-
     # 8) maps
     steps[8] = [py, script("6_maps.py"), "--config", cfg_path]
 

@@ -40,6 +40,22 @@ def rp_sort_key(rp):
         return 10**18
 
 
+def _rp_years(rp):
+    try:
+        return float(str(rp))
+    except Exception:
+        return np.nan
+
+
+def eta_tag_cm(H_m: float) -> str:
+    """
+    Turn threshold (m) into a stable tag in centimeters.
+    0.1 -> 010cm, 0.25 -> 025cm, 1.0 -> 100cm, 10.0 -> 1000cm
+    """
+    cm = int(round(float(H_m) * 100.0))
+    return f"{cm:03d}cm"  # width is minimum; 1000cm will show as 1000cm
+
+
 def raster_basic_stats_from_array(Z):
     Z = np.asarray(Z, dtype="float32")
     Z = Z[np.isfinite(Z)]
@@ -73,6 +89,32 @@ def sample_raster_at_points_chunked(src, xs, ys, chunk=200000):
         out[sl] = vals
     return out.astype("float64")
 
+def rp_bin_rates_years(rp_years_list):
+    """
+    Incremental annual rates for nested RP levels:
+      lam_i = 1/RP_i - 1/RP_{i+1}, last uses 0 for next.
+    Assumes rp_years_list is sorted increasing.
+    """
+    rps = np.asarray(rp_years_list, dtype=float)
+    rates = np.zeros_like(rps, dtype=float)
+
+    for i in range(len(rps)):
+        rp = rps[i]
+        if not (np.isfinite(rp) and rp > 0):
+            rates[i] = 0.0
+            continue
+
+        if i + 1 < len(rps):
+            rp2 = rps[i + 1]
+            nxt = (1.0 / rp2) if (np.isfinite(rp2) and rp2 > 0) else 0.0
+        else:
+            nxt = 0.0
+
+        rates[i] = (1.0 / rp) - nxt
+        if rates[i] < 0:  # safety if RP list is not strictly increasing
+            rates[i] = 0.0
+
+    return rates
 
 def sample_pga(src_obj, xs, ys, chunk=200000):
     """
@@ -122,13 +164,17 @@ def _mc_centers(idx_row, mc_df):
     return xc, yc
 
 
-def _compute_metrics_for_type(mc_df, idx_row, pga_srcs, rp_list, k_factor, chunk):
+def _compute_metrics_for_type(mc_df, idx_row, pga_srcs, rp_list, k_factor, chunk, eta_min, eta_thresholds):
     """
     For one failure-type (trans or rot):
       - samples PGA at each trial center
-      - computes Pf, and eta0 tail percentiles among failing trials
-    Returns dict:
-      { n, per_rp[rp] = {pga_mean, Pf, ef, mcount, fcount} }
+      - computes:
+          Pf_fail = P(PGA >= kcrit)
+          PfT     = P(PGA >= kcrit AND eta0 >= eta_min)
+          PfH{H}  = P(PGA >= kcrit AND eta0 >= H) for each H in eta_thresholds
+      - returns eta0 arrays among:
+          ef_fail = eta0 among failing trials
+          ef_tsu  = eta0 among tsunamigenic failing trials (eta0 >= eta_min)
     """
     need = {"s0_m", "s1_m", "kcrit", "eta0_m"}
     if (not need.issubset(mc_df.columns)) or (len(mc_df) == 0):
@@ -147,33 +193,69 @@ def _compute_metrics_for_type(mc_df, idx_row, pga_srcs, rp_list, k_factor, chunk
             continue
 
         pga = sample_pga(src, xc, yc, chunk=chunk) * float(k_factor)
+
         m = np.isfinite(pga) & np.isfinite(kcrit)
+        m_eta = m & np.isfinite(eta0)
 
         if int(np.sum(m)) == 0:
             out["per_rp"][rp] = dict(
                 pga_mean=np.nan,
-                Pf=np.nan,
-                ef=np.array([], float),
+                Pf_fail=np.nan,
+                Pf_tsu=np.nan,
+                ef_fail=np.array([], float),
+                ef_tsu=np.array([], float),
                 mcount=0,
+                mcount_eta=0,
                 fcount=0,
+                tcount=0,
+                thr={},  # thresholds
             )
             continue
 
         fail = (pga[m] >= kcrit[m])
-        ef = eta0[m][fail]
+        ef_fail = eta0[m][fail]
+
+        # tsunamigenic subset uses eta0 finite
+        fail_eta = (pga[m_eta] >= kcrit[m_eta])
+        tsu = fail_eta & (eta0[m_eta] >= float(eta_min))
+        ef_tsu = eta0[m_eta][tsu]
+
+        # multi-threshold exceedance among (fail_eta)
+        thr = {}
+        if eta_thresholds:
+            for H in eta_thresholds:
+                tag = eta_tag_cm(H)
+                hh = float(H)
+                ok = fail_eta & (eta0[m_eta] >= hh)
+                thr[tag] = dict(
+                    Pf=float(np.mean(ok)) if np.sum(m_eta) > 0 else np.nan,
+                    tcount=int(np.sum(ok)),
+                    H_m=hh,
+                )
 
         out["per_rp"][rp] = dict(
             pga_mean=float(np.nanmean(pga[m])),
-            Pf=float(np.mean(fail)),
-            ef=np.asarray(ef, float),
+            Pf_fail=float(np.mean(fail)),
+            Pf_tsu=float(np.mean(tsu)) if np.sum(m_eta) > 0 else np.nan,
+            ef_fail=np.asarray(ef_fail, float),
+            ef_tsu=np.asarray(ef_tsu, float),
             mcount=int(np.sum(m)),
+            mcount_eta=int(np.sum(m_eta)),
             fcount=int(np.sum(fail)),
+            tcount=int(np.sum(tsu)),
+            thr=thr,
         )
 
     return out
 
 
-def process_one_transect(tid, idx_df, pga_srcs, rp_list, trans_path, rot_path, pcts, k_factor, chunk):
+def process_one_transect(
+    tid, idx_df, pga_srcs, rp_list,
+    trans_path, rot_path,
+    pcts, k_factor, chunk,
+    eta_min,
+    eta_thresholds
+):
     idr = idx_df[idx_df["transect_id"] == tid]
     if len(idr) != 1:
         return None
@@ -186,11 +268,11 @@ def process_one_transect(tid, idx_df, pga_srcs, rp_list, trans_path, rot_path, p
 
     if trans_path and os.path.exists(trans_path):
         mc_t = pd.read_csv(trans_path)
-        info_trans = _compute_metrics_for_type(mc_t, idr, pga_srcs, rp_list, k_factor, chunk)
+        info_trans = _compute_metrics_for_type(mc_t, idr, pga_srcs, rp_list, k_factor, chunk, eta_min, eta_thresholds)
 
     if rot_path and os.path.exists(rot_path):
         mc_r = pd.read_csv(rot_path)
-        info_rot = _compute_metrics_for_type(mc_r, idr, pga_srcs, rp_list, k_factor, chunk)
+        info_rot = _compute_metrics_for_type(mc_r, idr, pga_srcs, rp_list, k_factor, chunk, eta_min, eta_thresholds)
 
     row["n_trans"] = int(info_trans["n"]) if info_trans else 0
     row["n_rot"] = int(info_rot["n"]) if info_rot else 0
@@ -199,16 +281,44 @@ def process_one_transect(tid, idx_df, pga_srcs, rp_list, trans_path, rot_path, p
     if row["n_any"] == 0:
         return None
 
+    # Keep tags for consistent output columns
+    thr_tags = [eta_tag_cm(h) for h in eta_thresholds] if eta_thresholds else []
+
     for rp in rp_list:
+        rpY = _rp_years(rp)
+
         # -------- trans
         if info_trans and info_trans["per_rp"].get(rp) is not None:
             d = info_trans["per_rp"][rp]
+
             row[f"pga{rp}_g_center_mean_trans"] = d["pga_mean"]
-            row[f"Pf_{rp}_trans"] = d["Pf"]
+            row[f"Pf_{rp}_trans"] = d["Pf_fail"]
             row[f"valid_{rp}_trans"] = d["mcount"]
             row[f"fail_{rp}_trans"] = d["fcount"]
             for p in pcts:
-                row[f"eta0_fail{rp}_p{int(100*p):02d}_m_trans"] = quantile_safe(d["ef"], p)
+                row[f"eta0_fail{rp}_p{int(100*p):02d}_m_trans"] = quantile_safe(d["ef_fail"], p)
+
+            # existing "tsu subset" (eta0 >= eta_min)
+            row[f"PfT_{rp}_trans"] = d["Pf_tsu"]
+            for p in pcts:
+                row[f"eta0_tsu{rp}_p{int(100*p):02d}_m_trans"] = quantile_safe(d["ef_tsu"], p)
+
+            if np.isfinite(rpY) and rpY > 0 and np.isfinite(d["Pf_tsu"]):
+                psmf = float(d["Pf_tsu"]) / float(rpY)
+                row[f"PSMF_{rp}_trans"] = psmf
+                row[f"RP_SMF_{rp}_trans"] = (1.0 / psmf) if psmf > 0 else np.nan
+            else:
+                row[f"PSMF_{rp}_trans"] = np.nan
+                row[f"RP_SMF_{rp}_trans"] = np.nan
+
+            # NEW: exceedance for multiple thresholds (eta0 >= H)
+            for tag in thr_tags:
+                key = f"PfH{tag}_{rp}_trans"
+                if tag in d.get("thr", {}):
+                    row[key] = d["thr"][tag]["Pf"]
+                else:
+                    row[key] = np.nan
+
         else:
             row[f"pga{rp}_g_center_mean_trans"] = np.nan
             row[f"Pf_{rp}_trans"] = np.nan
@@ -217,15 +327,45 @@ def process_one_transect(tid, idx_df, pga_srcs, rp_list, trans_path, rot_path, p
             for p in pcts:
                 row[f"eta0_fail{rp}_p{int(100*p):02d}_m_trans"] = np.nan
 
+            row[f"PfT_{rp}_trans"] = np.nan
+            for p in pcts:
+                row[f"eta0_tsu{rp}_p{int(100*p):02d}_m_trans"] = np.nan
+            row[f"PSMF_{rp}_trans"] = np.nan
+            row[f"RP_SMF_{rp}_trans"] = np.nan
+
+            for tag in thr_tags:
+                row[f"PfH{tag}_{rp}_trans"] = np.nan
+
         # -------- rot
         if info_rot and info_rot["per_rp"].get(rp) is not None:
             d = info_rot["per_rp"][rp]
+
             row[f"pga{rp}_g_center_mean_rot"] = d["pga_mean"]
-            row[f"Pf_{rp}_rot"] = d["Pf"]
+            row[f"Pf_{rp}_rot"] = d["Pf_fail"]
             row[f"valid_{rp}_rot"] = d["mcount"]
             row[f"fail_{rp}_rot"] = d["fcount"]
             for p in pcts:
-                row[f"eta0_fail{rp}_p{int(100*p):02d}_m_rot"] = quantile_safe(d["ef"], p)
+                row[f"eta0_fail{rp}_p{int(100*p):02d}_m_rot"] = quantile_safe(d["ef_fail"], p)
+
+            row[f"PfT_{rp}_rot"] = d["Pf_tsu"]
+            for p in pcts:
+                row[f"eta0_tsu{rp}_p{int(100*p):02d}_m_rot"] = quantile_safe(d["ef_tsu"], p)
+
+            if np.isfinite(rpY) and rpY > 0 and np.isfinite(d["Pf_tsu"]):
+                psmf = float(d["Pf_tsu"]) / float(rpY)
+                row[f"PSMF_{rp}_rot"] = psmf
+                row[f"RP_SMF_{rp}_rot"] = (1.0 / psmf) if psmf > 0 else np.nan
+            else:
+                row[f"PSMF_{rp}_rot"] = np.nan
+                row[f"RP_SMF_{rp}_rot"] = np.nan
+
+            for tag in thr_tags:
+                key = f"PfH{tag}_{rp}_rot"
+                if tag in d.get("thr", {}):
+                    row[key] = d["thr"][tag]["Pf"]
+                else:
+                    row[key] = np.nan
+
         else:
             row[f"pga{rp}_g_center_mean_rot"] = np.nan
             row[f"Pf_{rp}_rot"] = np.nan
@@ -234,39 +374,113 @@ def process_one_transect(tid, idx_df, pga_srcs, rp_list, trans_path, rot_path, p
             for p in pcts:
                 row[f"eta0_fail{rp}_p{int(100*p):02d}_m_rot"] = np.nan
 
-        # -------- any (concat; Pf weighted by valid counts; eta0 tails from concatenated failing set)
-        ef_all = []
+            row[f"PfT_{rp}_rot"] = np.nan
+            for p in pcts:
+                row[f"eta0_tsu{rp}_p{int(100*p):02d}_m_rot"] = np.nan
+            row[f"PSMF_{rp}_rot"] = np.nan
+            row[f"RP_SMF_{rp}_rot"] = np.nan
+
+            for tag in thr_tags:
+                row[f"PfH{tag}_{rp}_rot"] = np.nan
+
+        # -------- any (concat; Pf weighted by valid counts; eta0 tails from concatenated sets)
+        ef_fail_all = []
+        ef_tsu_all = []
         valid_any = 0
         fail_any = 0
+        tsu_any = 0
+
+        # NEW: threshold counts for "any"
+        thr_tcount_any = {tag: 0 for tag in thr_tags}
+
         pga_num = 0.0
         pga_den = 0.0
 
         if info_trans and info_trans["per_rp"].get(rp) is not None:
             d = info_trans["per_rp"][rp]
-            ef_all.append(d["ef"])
+            ef_fail_all.append(d["ef_fail"])
+            ef_tsu_all.append(d["ef_tsu"])
             valid_any += int(d["mcount"])
             fail_any += int(d["fcount"])
+            tsu_any += int(d["tcount"])
             if np.isfinite(d["pga_mean"]) and d["mcount"] > 0:
                 pga_num += float(d["pga_mean"]) * float(d["mcount"])
                 pga_den += float(d["mcount"])
+
+            # NEW: add threshold counts
+            for tag in thr_tags:
+                if tag in d.get("thr", {}):
+                    thr_tcount_any[tag] += int(d["thr"][tag]["tcount"])
 
         if info_rot and info_rot["per_rp"].get(rp) is not None:
             d = info_rot["per_rp"][rp]
-            ef_all.append(d["ef"])
+            ef_fail_all.append(d["ef_fail"])
+            ef_tsu_all.append(d["ef_tsu"])
             valid_any += int(d["mcount"])
             fail_any += int(d["fcount"])
+            tsu_any += int(d["tcount"])
             if np.isfinite(d["pga_mean"]) and d["mcount"] > 0:
                 pga_num += float(d["pga_mean"]) * float(d["mcount"])
                 pga_den += float(d["mcount"])
 
-        ef_all = np.concatenate(ef_all) if len(ef_all) else np.array([], float)
+            for tag in thr_tags:
+                if tag in d.get("thr", {}):
+                    thr_tcount_any[tag] += int(d["thr"][tag]["tcount"])
+
+        ef_fail_all = np.concatenate(ef_fail_all) if len(ef_fail_all) else np.array([], float)
+        ef_tsu_all = np.concatenate(ef_tsu_all) if len(ef_tsu_all) else np.array([], float)
 
         row[f"pga{rp}_g_center_mean_any"] = (pga_num / pga_den) if pga_den > 0 else np.nan
+
         row[f"Pf_{rp}_any"] = (float(fail_any) / float(valid_any)) if valid_any > 0 else np.nan
         row[f"valid_{rp}_any"] = int(valid_any)
         row[f"fail_{rp}_any"] = int(fail_any)
         for p in pcts:
-            row[f"eta0_fail{rp}_p{int(100*p):02d}_m_any"] = quantile_safe(ef_all, p)
+            row[f"eta0_fail{rp}_p{int(100*p):02d}_m_any"] = quantile_safe(ef_fail_all, p)
+
+        row[f"PfT_{rp}_any"] = (float(tsu_any) / float(valid_any)) if valid_any > 0 else np.nan
+        for p in pcts:
+            row[f"eta0_tsu{rp}_p{int(100*p):02d}_m_any"] = quantile_safe(ef_tsu_all, p)
+
+        if np.isfinite(rpY) and rpY > 0 and valid_any > 0:
+            pft = row[f"PfT_{rp}_any"]
+            if np.isfinite(pft):
+                psmf = float(pft) / float(rpY)
+                row[f"PSMF_{rp}_any"] = psmf
+                row[f"RP_SMF_{rp}_any"] = (1.0 / psmf) if psmf > 0 else np.nan
+            else:
+                row[f"PSMF_{rp}_any"] = np.nan
+                row[f"RP_SMF_{rp}_any"] = np.nan
+        else:
+            row[f"PSMF_{rp}_any"] = np.nan
+            row[f"RP_SMF_{rp}_any"] = np.nan
+
+        # NEW: PfH for "any"
+        for tag in thr_tags:
+            row[f"PfH{tag}_{rp}_any"] = (float(thr_tcount_any[tag]) / float(valid_any)) if valid_any > 0 else np.nan
+
+    # Store eta_min used
+    row["eta_min_m"] = float(eta_min)
+
+    # NEW: integrated hazard across RP using *incremental* annual rates (Grilli-style)
+    # AERH{tag}_{typ} = Σ_i (1/RP_i - 1/RP_{i+1}) * PfH{tag}_{RP_i,typ}
+    rp_years = [float(_rp_years(rp)) for rp in rp_list]
+    rates = rp_bin_rates_years(rp_years)
+
+    for tag in thr_tags:
+        for typ in ["trans", "rot", "any"]:
+            pf_list = []
+            for rp in rp_list:
+                col = f"PfH{tag}_{rp}_{typ}"
+                pf_list.append(row.get(col, np.nan))
+
+            pf = np.asarray(pf_list, dtype=float)
+            # treat missing as 0 contribution (safer than NaN-propagation)
+            pf = np.nan_to_num(pf, nan=0.0)
+
+            a = float(np.sum(rates * pf))
+            row[f"AERH{tag}_{typ}"] = a
+            row[f"RPH{tag}_{typ}"] = (1.0 / a) if a > 0 else np.nan
 
     return row
 
@@ -276,7 +490,8 @@ def process_one_transect(tid, idx_df, pga_srcs, rp_list, trans_path, rot_path, p
 # -----------------------------
 def main():
     ap = argparse.ArgumentParser(
-        description="Step 5: Sample PGA at each MC trial center and compute Pf + conditional eta0 tails for all RPs in config (trans/rot/any)."
+        description="Step 5: Sample PGA at each MC trial center and compute Pf + eta0 tails for all RPs in config "
+                    "(trans/rot/any). Adds tsunamigenic metrics using eta0 >= eta_min, and optional multi-threshold exceedance."
     )
     ap.add_argument("--config", required=True, help="Path to case config.json")
 
@@ -299,8 +514,17 @@ def main():
     ap.add_argument("--k-factor", type=float, default=None,
                     help="Override k_factor (default from config pga_loading.k_factor).")
 
+    ap.add_argument("--eta-min", type=float, default=None,
+                    help="Tsunamigenic threshold: count only failures with eta0 >= eta_min (meters). "
+                         "Default: config pga_loading.eta_min_m, else 0.5 m.")
+
+    ap.add_argument("--eta-thresholds", type=str, default=None,
+                    help="Comma list of eta thresholds (m) for exceedance (PfH*/AERH*/RPH*). "
+                         "Default: config pga_loading.eta_thresholds_m (if present). "
+                         "Example: --eta-thresholds 0.1,0.25,0.5,1,2")
+
     ap.add_argument("--pcts", default="50,90,95,99",
-                    help="Fail-eta percentiles (comma list, in percent).")
+                    help="Fail-eta percentiles (comma list, in percent). Used for both fail-only and tsu-only tails.")
 
     ap.add_argument("--quick-maps", action="store_true",
                     help="Write quick sanity point maps for ONE RP (chosen by --map-rp or default = largest RP).")
@@ -333,6 +557,27 @@ def main():
     # k factor
     k_factor_cfg = float(cfg.get("pga_loading", {}).get("k_factor", 1.0))
     k_factor = float(args.k_factor) if args.k_factor is not None else k_factor_cfg
+
+    # eta_min (for PfT + eta0_tsu tails)
+    eta_min_cfg = float(cfg.get("pga_loading", {}).get("eta_min_m", 0.5))
+    eta_min = float(args.eta_min) if args.eta_min is not None else eta_min_cfg
+
+    # eta thresholds for exceedance (PfH*/AERH*/RPH*)
+    eta_thresholds = None
+    if args.eta_thresholds is not None:
+        eta_thresholds = [float(x) for x in str(args.eta_thresholds).split(",") if x.strip() != ""]
+    else:
+        thr_cfg = cfg.get("pga_loading", {}).get("eta_thresholds_m", None)
+        if isinstance(thr_cfg, list):
+            eta_thresholds = [float(x) for x in thr_cfg]
+        elif isinstance(thr_cfg, str):
+            eta_thresholds = [float(x) for x in thr_cfg.split(",") if x.strip() != ""]
+
+    if eta_thresholds is None:
+        eta_thresholds = []  # opt-in only
+    else:
+        # clean/sort/unique
+        eta_thresholds = sorted(set([float(x) for x in eta_thresholds if np.isfinite(x) and x >= 0.0]))
 
     # percentiles
     pcts = [float(x) / 100.0 for x in str(args.pcts).split(",") if x.strip() != ""]
@@ -404,11 +649,10 @@ def main():
     if not pga_srcs:
         raise SystemExit("No PGA rasters were found/loaded. Check config paths.pga_rasters and file paths.")
 
-    # Keep order but only those loaded
     rp_loaded = [rp for rp in rp_list if str(rp) in pga_srcs]
 
-    print("\n=== Processing transects: n_jobs={}, backend={}, load_to_ram={}, k_factor={} ===".format(
-        args.n_jobs, args.backend, load_to_ram, k_factor
+    print("\n=== Processing transects: n_jobs={}, backend={}, load_to_ram={}, k_factor={}, eta_min={} m, eta_thresholds={} ===".format(
+        args.n_jobs, args.backend, load_to_ram, k_factor, eta_min, eta_thresholds
     ))
 
     prefer = "threads" if args.backend == "threading" else "processes"
@@ -423,6 +667,8 @@ def main():
             pcts,
             k_factor,
             int(args.chunk),
+            eta_min,
+            eta_thresholds,
         )
         for tid in tids
     )
@@ -432,7 +678,7 @@ def main():
     out.to_csv(out_csv, index=False)
     print(f"\n[OK] wrote {out_csv}")
 
-    # Optional quick maps (RP generic)
+    # Optional quick maps (still uses existing Pf/eta0_fail columns)
     if args.quick_maps and len(out) > 0:
         if not os.path.exists(bathy_tif):
             print(f"[WARN] quick maps skipped: missing bathy tif: {bathy_tif}")

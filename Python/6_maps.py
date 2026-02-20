@@ -14,6 +14,46 @@ sys.path.insert(0, PROJECT_ROOT)
 from utilities.config import load_config, abspath
 
 
+
+import re
+
+def eta_tag_cm(H_m: float) -> str:
+    cm = int(round(float(H_m) * 100.0))
+    return f"{cm:03d}cm"  # 0.5m -> 050cm
+
+def infer_haz_tags_from_df(df):
+    """
+    Look for hazard columns like AERH050cm_any or RPH050cm_any and return tags: ["050cm", ...]
+    """
+    tags = set()
+    for c in df.columns:
+        m = re.match(r"^(AERH|RPH)(\d+cm)_(any|trans|rot)$", c)
+        if m:
+            tags.add(m.group(2))
+    def key(t):
+        try:
+            return int(t.replace("cm", ""))
+        except Exception:
+            return 10**18
+    return sorted(list(tags), key=key)
+
+def pick_label_points(
+    df, label_top_n, by_col,
+    id_col="transect_id", x_col="x0", y_col="y0",
+    ascending=False,
+):
+    if (not label_top_n) or label_top_n <= 0:
+        return None, None, None
+    if by_col not in df.columns:
+        return None, None, None
+
+    tmp = df[[id_col, x_col, y_col, by_col]].copy()
+    tmp = tmp[np.isfinite(tmp[by_col].to_numpy(float))]
+    if tmp.empty:
+        return None, None, None
+
+    top = tmp.sort_values(by_col, ascending=bool(ascending)).head(int(label_top_n))
+    return top[id_col].to_numpy(), top[x_col].to_numpy(), top[y_col].to_numpy()
 # -----------------------------
 # Plot helpers
 # -----------------------------
@@ -42,7 +82,7 @@ def plot_points_on_bathy(
 
     fig, ax = plt.subplots(figsize=(10, 10))
 
-    # Background bathy (viridis)
+    # Background bathy
     im = ax.imshow(
         np.ma.masked_invalid(Z),
         extent=extent,
@@ -50,7 +90,7 @@ def plot_points_on_bathy(
         cmap=bathy_cmap,
     )
 
-    # Bathy colorbar: horizontal + smaller
+    # Bathy colorbar
     cbar_b = fig.colorbar(
         im, ax=ax,
         orientation="horizontal",
@@ -61,7 +101,7 @@ def plot_points_on_bathy(
     cbar_b.set_label("bathy (m)")
     cbar_b.ax.tick_params(labelsize=tick_labelsize)
 
-    # Points (jet)
+    # Points
     sc = ax.scatter(
         x, y,
         c=values,
@@ -71,7 +111,7 @@ def plot_points_on_bathy(
         linewidth=0.3,
     )
 
-    # Values colorbar: vertical + smaller
+    # Values colorbar
     cbar_s = fig.colorbar(
         sc, ax=ax,
         orientation="vertical",
@@ -96,6 +136,7 @@ def plot_points_on_bathy(
     ax.set_title(title)
     ax.set_xlabel("Easting (m)")
     ax.set_ylabel("Northing (m)")
+    ax.set_aspect("equal", adjustable="box")
 
     fig.tight_layout()
     fig.savefig(outpng, dpi=250)
@@ -103,19 +144,6 @@ def plot_points_on_bathy(
     print("[OK] wrote", outpng)
 
 
-def pick_label_points(df, label_top_n, by_col, id_col="transect_id", x_col="x0", y_col="y0"):
-    if (not label_top_n) or label_top_n <= 0:
-        return None, None, None
-    if by_col not in df.columns:
-        return None, None, None
-
-    tmp = df[[id_col, x_col, y_col, by_col]].copy()
-    tmp = tmp[np.isfinite(tmp[by_col].to_numpy(float))]
-    if tmp.empty:
-        return None, None, None
-
-    top = tmp.sort_values(by_col, ascending=False).head(int(label_top_n))
-    return top[id_col].to_numpy(), top[x_col].to_numpy(), top[y_col].to_numpy()
 
 
 def ensure_xy(summary_df, index_csv):
@@ -150,17 +178,24 @@ def _sort_rps(rps):
 
 
 def _existing_rps_in_summary(df):
-    # infer RPs from columns like Pf_475_any or eta0_fail475_p99_m_any
+    """
+    infer RPs from columns:
+      Pf_475_any
+      PfT_475_any
+      eta0_fail475_p99_m_any
+      eta0_tsu475_p99_m_any
+      PSMF_475_any
+      RP_SMF_475_any
+    """
     rps = set()
     for c in df.columns:
-        if c.startswith("Pf_"):
+        if c.startswith("Pf_") or c.startswith("PfT_") or c.startswith("PSMF_") or c.startswith("RP_SMF_"):
             parts = c.split("_")
             if len(parts) >= 3:
                 rps.add(parts[1])
+
         elif c.startswith("eta0_fail"):
-            # eta0_fail{rp}_pXX_m_{typ}
             s = c[len("eta0_fail"):]
-            # take leading digits as rp
             rp = ""
             for ch in s:
                 if ch.isdigit():
@@ -169,54 +204,26 @@ def _existing_rps_in_summary(df):
                     break
             if rp:
                 rps.add(rp)
+
+        elif c.startswith("eta0_tsu"):
+            s = c[len("eta0_tsu"):]
+            rp = ""
+            for ch in s:
+                if ch.isdigit():
+                    rp += ch
+                else:
+                    break
+            if rp:
+                rps.add(rp)
+
     return _sort_rps(rps)
-
-
-def choose_default_label_col(df, rps, types, eta_pcts, prefer_type="any"):
-    """
-    Priority:
-      1) eta0_fail{max_rp}_p{max_pct}_m_{prefer_type}
-      2) eta0_fail{max_rp}_p{max_pct}_m_{first_available_type}
-      3) Pf_{max_rp}_{prefer_type}
-      4) Pf_{max_rp}_{first_available_type}
-      5) first eta0_fail... column
-      6) first Pf_... column
-    """
-    rps = _sort_rps(rps)
-    if not rps:
-        return None
-    rp = rps[-1]
-    eta_pcts = sorted([int(p) for p in eta_pcts]) if eta_pcts else [99]
-    p = eta_pcts[-1]
-
-    types_in = [t for t in types if t] if types else ["any", "trans", "rot"]
-    types_pref = [prefer_type] + [t for t in types_in if t != prefer_type]
-
-    for typ in types_pref:
-        c = f"eta0_fail{rp}_p{p:02d}_m_{typ}"
-        if c in df.columns:
-            return c
-
-    for typ in types_pref:
-        c = f"Pf_{rp}_{typ}"
-        if c in df.columns:
-            return c
-
-    for c in df.columns:
-        if c.startswith("eta0_fail"):
-            return c
-    for c in df.columns:
-        if c.startswith("Pf_"):
-            return c
-
-    return None
 
 
 # -----------------------------
 # Main
 # -----------------------------
 def main():
-    ap = argparse.ArgumentParser(description="Step 6: Make Pf/eta0 point maps from summary CSV (config-driven).")
+    ap = argparse.ArgumentParser(description="Step 6: Make point maps from summary CSV (config-driven).")
     ap.add_argument("--config", required=True, help="Path to case config.json")
 
     ap.add_argument("--summary-csv", default=None,
@@ -229,18 +236,33 @@ def main():
                     help="Override output maps dir (else config outputs.maps_dir)")
 
     ap.add_argument("--rps", default=None,
-                    help="Comma-separated return periods to map. "
-                         "Default: infer from summary columns.")
+                    help="Comma-separated return periods to map. Default: infer from summary columns.")
     ap.add_argument("--types", default="any,trans,rot",
                     help="Comma-separated types to map: any,trans,rot")
 
     ap.add_argument("--eta-pcts", default="99",
-                    help="Comma-separated percentiles for eta0_fail (e.g. '90,95,99')")
+                    help="Comma-separated percentiles for eta0_* (e.g. '90,95,99')")
+
+    ap.add_argument("--map-set", default="fail",
+                    help="What to map: comma list among {fail,tsu,smf}. "
+                         "fail=Pf+eta0_fail, tsu=PfT+eta0_tsu, smf=PSMF+RP_SMF. Example: --map-set fail,tsu")
+
     ap.add_argument("--label-top-n", type=int, default=10,
                     help="Label top-N transects on maps (0 disables).")
 
     ap.add_argument("--label-by", default=None,
-                    help="Column to rank for labels. Default: auto-pick (highest RP + highest eta pct + type=any if possible).")
+                    help="GLOBAL labeling: one column to rank for labels across ALL maps. "
+                         "If not set, default behavior is per-map labeling (labels match each map).")
+
+    ap.add_argument("--label-mode", default=None, choices=["per-map", "global"],
+                    help="Label mode. Default: per-map if --label-by not set, else global.")
+
+    ap.add_argument("--haz-thr", default=None,
+                    help="Eta thresholds in meters for hazard maps (comma list). "
+                        "Example: --haz-thr 0.5 or --haz-thr 0.1,0.5,1.0")
+
+    ap.add_argument("--haz-what", default="aer,rp",
+                    help="Which hazard metrics to map: aer (AERH*) and/or rp (RPH*). Default: aer,rp")
 
     args = ap.parse_args()
 
@@ -269,11 +291,29 @@ def main():
 
     types = [s.strip() for s in str(args.types).split(",") if s.strip() != ""]
     eta_pcts = [int(s.strip()) for s in str(args.eta_pcts).split(",") if s.strip() != ""]
+    map_set = {s.strip().lower() for s in str(args.map_set).split(",") if s.strip() != ""}
 
+
+
+    haz_what = {s.strip().lower() for s in str(args.haz_what).split(",") if s.strip()}
+
+    # hazard tags to map
+    haz_tags = []
+    if "haz" in map_set:
+        if args.haz_thr is not None:
+            hs = [float(x) for x in str(args.haz_thr).split(",") if x.strip() != ""]
+            haz_tags = [eta_tag_cm(h) for h in hs]
+        else:
+            # if user didn't specify, infer from columns
+            haz_tags = infer_haz_tags_from_df(df)
+
+        if not haz_tags:
+            raise SystemExit("map-set includes 'haz' but no hazard thresholds found. "
+                            "Either pass --haz-thr (e.g. 0.5) or ensure summary has AERH*/RPH* columns.")
+        
     # RPs: either user-specified or inferred from summary
     if args.rps:
-        rps = [s.strip() for s in str(args.rps).split(",") if s.strip() != ""]
-        rps = _sort_rps(rps)
+        rps = _sort_rps([s.strip() for s in str(args.rps).split(",") if s.strip() != ""])
     else:
         rps = _existing_rps_in_summary(df)
 
@@ -288,56 +328,174 @@ def main():
     x = df["x0"].to_numpy(float)
     y = df["y0"].to_numpy(float)
 
-    # Label selection
-    label_col = args.label_by
-    if label_col is None:
-        label_col = choose_default_label_col(df, rps=rps, types=types, eta_pcts=eta_pcts, prefer_type="any")
+    # -----------------------------
+    # LABELING: per-map or global
+    # -----------------------------
+    label_mode = args.label_mode
+    if label_mode is None:
+        label_mode = "global" if args.label_by else "per-map"
 
-    label_ids = label_x = label_y = None
-    if label_col is not None:
-        label_ids, label_x, label_y = pick_label_points(df, args.label_top_n, label_col)
-        if label_ids is not None:
-            print(f"[INFO] labeling top {args.label_top_n} by: {label_col}")
-    else:
-        print("[INFO] labeling disabled (no suitable label column found).")
-        label_ids = label_x = label_y = None
+    label_ids_g = label_x_g = label_y_g = None
+    label_cache = {}
+
+    if args.label_top_n <= 0:
+        print("[INFO] labeling disabled (--label-top-n <= 0)")
+        label_mode = "none"
+
+    if label_mode == "global":
+        if args.label_by is None:
+            print("[WARN] label-mode=global but --label-by not set -> disabling labels")
+            label_mode = "none"
+        else:
+            label_ids_g, label_x_g, label_y_g = pick_label_points(df, args.label_top_n, args.label_by)
+            if label_ids_g is not None:
+                print(f"[INFO] labeling (global) top {args.label_top_n} by: {args.label_by}")
+            else:
+                print(f"[WARN] labeling (global) failed for column: {args.label_by} -> disabling labels")
+                label_mode = "none"
+
+    elif label_mode == "per-map":
+        print(f"[INFO] labeling (per-map): top {args.label_top_n} by each map variable")
+
+    def get_labels(by_col):
+        if label_mode == "none":
+            return (None, None, None)
+        if label_mode == "global":
+            return (label_ids_g, label_x_g, label_y_g)
+        # per-map
+        if by_col in label_cache:
+            return label_cache[by_col]
+        labs = pick_label_points(df, args.label_top_n, by_col)
+        label_cache[by_col] = labs
+        return labs
 
     mapped_cols = []
 
     # -----------------------------
-    # MAPS: Pf and eta0_fail percentiles per RP/type
+    # MAPS
     # -----------------------------
     for rp in rps:
         for typ in types:
-            pf_col = f"Pf_{rp}_{typ}"
-            if pf_col in df.columns:
-                outpng = os.path.join(out_dir, f"map_{pf_col}.png")
-                plot_points_on_bathy(
-                    Zb, extent, x, y, df[pf_col].to_numpy(float),
-                    title=pf_col,
-                    outpng=outpng,
-                    label_ids=label_ids, label_x=label_x, label_y=label_y,
-                    cbar_label=pf_col
-                )
-                mapped_cols.append(pf_col)
-            else:
-                print("[SKIP] missing column:", pf_col)
 
-            for p in eta_pcts:
-                eta_col = f"eta0_fail{rp}_p{p:02d}_m_{typ}"
-                if eta_col in df.columns:
-                    outpng = os.path.join(out_dir, f"map_{eta_col}.png")
+            if "fail" in map_set:
+                pf_col = f"Pf_{rp}_{typ}"
+                if pf_col in df.columns:
+                    lab_ids, lab_x, lab_y = get_labels(pf_col)
+                    outpng = os.path.join(out_dir, f"map_{pf_col}.png")
                     plot_points_on_bathy(
-                        Zb, extent, x, y, df[eta_col].to_numpy(float),
-                        title=eta_col,
-                        outpng=outpng,
-                        label_ids=label_ids, label_x=label_x, label_y=label_y,
-                        cbar_label=eta_col
+                        Zb, extent, x, y, df[pf_col].to_numpy(float),
+                        title=pf_col, outpng=outpng,
+                        label_ids=lab_ids, label_x=lab_x, label_y=lab_y,
+                        cbar_label=pf_col
                     )
-                    mapped_cols.append(eta_col)
-                else:
-                    print("[SKIP] missing column:", eta_col)
+                    mapped_cols.append(pf_col)
 
+                for p in eta_pcts:
+                    eta_col = f"eta0_fail{rp}_p{p:02d}_m_{typ}"
+                    if eta_col in df.columns:
+                        lab_ids, lab_x, lab_y = get_labels(eta_col)
+                        outpng = os.path.join(out_dir, f"map_{eta_col}.png")
+                        plot_points_on_bathy(
+                            Zb, extent, x, y, df[eta_col].to_numpy(float),
+                            title=eta_col, outpng=outpng,
+                            label_ids=lab_ids, label_x=lab_x, label_y=lab_y,
+                            cbar_label=eta_col
+                        )
+                        mapped_cols.append(eta_col)
+
+            if "tsu" in map_set:
+                pf_col = f"PfT_{rp}_{typ}"
+                if pf_col in df.columns:
+                    lab_ids, lab_x, lab_y = get_labels(pf_col)
+                    outpng = os.path.join(out_dir, f"map_{pf_col}.png")
+                    plot_points_on_bathy(
+                        Zb, extent, x, y, df[pf_col].to_numpy(float),
+                        title=pf_col, outpng=outpng,
+                        label_ids=lab_ids, label_x=lab_x, label_y=lab_y,
+                        cbar_label=pf_col
+                    )
+                    mapped_cols.append(pf_col)
+
+                for p in eta_pcts:
+                    eta_col = f"eta0_tsu{rp}_p{p:02d}_m_{typ}"
+                    if eta_col in df.columns:
+                        lab_ids, lab_x, lab_y = get_labels(eta_col)
+                        outpng = os.path.join(out_dir, f"map_{eta_col}.png")
+                        plot_points_on_bathy(
+                            Zb, extent, x, y, df[eta_col].to_numpy(float),
+                            title=eta_col, outpng=outpng,
+                            label_ids=lab_ids, label_x=lab_x, label_y=lab_y,
+                            cbar_label=eta_col
+                        )
+                        mapped_cols.append(eta_col)
+
+            if "smf" in map_set:
+                c1 = f"PSMF_{rp}_{typ}"
+                if c1 in df.columns:
+                    lab_ids, lab_x, lab_y = get_labels(c1)
+                    outpng = os.path.join(out_dir, f"map_{c1}.png")
+                    plot_points_on_bathy(
+                        Zb, extent, x, y, df[c1].to_numpy(float),
+                        title=c1, outpng=outpng,
+                        label_ids=lab_ids, label_x=lab_x, label_y=lab_y,
+                        cbar_label=c1
+                    )
+                    mapped_cols.append(c1)
+
+                c2 = f"RP_SMF_{rp}_{typ}"
+                if c2 in df.columns:
+                    lab_ids, lab_x, lab_y = get_labels(c2)
+                    outpng = os.path.join(out_dir, f"map_{c2}.png")
+                    plot_points_on_bathy(
+                        Zb, extent, x, y, df[c2].to_numpy(float),
+                        title=c2, outpng=outpng,
+                        label_ids=lab_ids, label_x=lab_x, label_y=lab_y,
+                        cbar_label=c2
+                    )
+                    mapped_cols.append(c2)
+                    
+        # -----------------------------
+    # HAZARD MAPS (
+    # -----------------------------
+    if "haz" in map_set:
+        for tag in haz_tags:
+            for typ in types:
+
+                # label mode: per-map labels follow the mapped column
+                def labels_for(colname):
+                    if args.label_mode == "per-map":
+                        asc = colname.startswith("RPH")  # for return period, "most hazardous" = smallest RP
+                        return pick_label_points(df, args.label_top_n, colname, ascending=asc)
+                    else:
+                        return (label_ids, label_x, label_y)
+
+                if "aer" in haz_what:
+                    col = f"AERH{tag}_{typ}"
+                    if col in df.columns:
+                        lid, lx, ly = labels_for(col)
+                        outpng = os.path.join(out_dir, f"map_{col}.png")
+                        plot_points_on_bathy(
+                            Zb, extent, x, y, df[col].to_numpy(float),
+                            title=col, outpng=outpng,
+                            label_ids=lid, label_x=lx, label_y=ly,
+                            cbar_label=col
+                        )
+                        mapped_cols.append(col)
+
+                if "rp" in haz_what:
+                    col = f"RPH{tag}_{typ}"
+                    if col in df.columns:
+                        lid, lx, ly = labels_for(col)
+                        outpng = os.path.join(out_dir, f"map_{col}.png")
+                        plot_points_on_bathy(
+                            Zb, extent, x, y, df[col].to_numpy(float),
+                            title=col, outpng=outpng,
+                            label_ids=lid, label_x=lx, label_y=ly,
+                            cbar_label=col
+                        )
+                        mapped_cols.append(col)
+
+                        
     inv = pd.DataFrame({"mapped_column": mapped_cols})
     inv_path = os.path.join(out_dir, "maps_inventory.csv")
     inv.to_csv(inv_path, index=False)

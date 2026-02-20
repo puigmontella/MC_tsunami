@@ -31,6 +31,10 @@
     "ds_m": 20,
     "depth_limit_m": -2500
   },
-  "pga_loading": { "k_factor": 1.0 },
+    "pga_loading": {
+    "k_factor": 1.0,
+    "eta_min_m": 0.1,
+    "eta_thresholds_m": [0.1, 0.25, 0.5, 1.0, 2.0]
+  },
   "regional_filter": { "L_max": 8000, "T_max": 150, "end_margin": 200 }
 }

@@ -6,9 +6,10 @@ Checks:
   A) Inputs exist + CRS/bounds consistency (bathy, coastline, PGA rasters)
   B) Transects: index + per-transect CSV integrity + "offshore" direction test
   C) Depth consistency: depth column vs resampled bathy at transect points (RMSE)
-  D) MC outputs: empty files, required columns, kcrit/eta0 sanity summaries
+  D) MC outputs: empty files, required columns, kcrit/eta0 sanity summaries (+ eta0 unit mismatch hint)
   E) Summary CSV: columns present, Pf in [0,1], monotonic with RP, PGA monotonic with RP
-  F) Optional quick plots (histograms + Pf vs PGA scatter)
+  F) Hazard sanity (if present): PfH ordering, RPH ~ 1/AERH, PfH threshold monotonicity
+  G) Optional quick plots (histograms + Pf vs PGA scatter)
 
 Exit codes:
   0 = OK (no errors; warnings allowed unless --fail-on-warn)
@@ -20,13 +21,13 @@ import os
 import sys
 import json
 import glob
+import re
 import argparse
 from dataclasses import dataclass, field
 from typing import Dict, Any, List, Tuple, Optional
 
 import numpy as np
 import pandas as pd
-
 import rasterio
 
 # project root on PYTHONPATH
@@ -34,7 +35,6 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, ROOT)
 
 from utilities.config import load_config, abspath  # noqa: E402
-
 
 # geopandas optional (coastline checks)
 try:
@@ -78,6 +78,7 @@ def _sort_rps(rps: List[str]) -> List[str]:
             return int(str(x))
         except Exception:
             return 10**18
+
     return sorted([str(r) for r in rps], key=key)
 
 
@@ -208,13 +209,14 @@ def check_crs_and_bounds(bathy_tif: str, coast_shp: Optional[str], rep: Report) 
 
             # Compare in bathy CRS
             if str(g.crs) != str(bathy_crs):
-                rep.add_warn(f"Coast CRS != Bathy CRS (will be reprojected in processing). coast={g.crs}, bathy={bathy_crs}")
+                rep.add_warn(
+                    f"Coast CRS != Bathy CRS (will be reprojected in processing). coast={g.crs}, bathy={bathy_crs}"
+                )
                 g2 = g.to_crs(bathy_crs)
             else:
                 g2 = g
 
             cb = g2.total_bounds  # minx,miny,maxx,maxy
-            # overlap test
             overlap = not (cb[2] < b.left or cb[0] > b.right or cb[3] < b.bottom or cb[1] > b.top)
             if overlap:
                 rep.add_ok("Coastline bounds overlap bathy bounds (good).")
@@ -224,9 +226,15 @@ def check_crs_and_bounds(bathy_tif: str, coast_shp: Optional[str], rep: Report) 
             rep.add_warn(f"Failed to read coastline shp: {e}")
 
 
-def check_transects(transects_dir: str, bathy_tif: str, rep: Report,
-                    offshore_eps_m: float = 50.0, offshore_test_m: float = 200.0,
-                    rmse_tol: float = 1e-2) -> None:
+def check_transects(
+    transects_dir: str,
+    bathy_tif: str,
+    rep: Report,
+    offshore_eps_m: float = 50.0,
+    rmse_tol: float = 1e-2,
+    offshore_tests_m=(200.0, 500.0, 1000.0, 2000.0, 3000.0),
+    deepen_tol_m: float = 0.5,
+) -> None:
     index_csv = os.path.join(transects_dir, "index.csv")
     rep.metrics["index_csv"] = index_csv
 
@@ -235,7 +243,6 @@ def check_transects(transects_dir: str, bathy_tif: str, rep: Report,
         return
 
     idx = pd.read_csv(index_csv)
-    # allow id or transect_id
     if "transect_id" not in idx.columns and "id" in idx.columns:
         idx = idx.rename(columns={"id": "transect_id"})
 
@@ -244,7 +251,6 @@ def check_transects(transects_dir: str, bathy_tif: str, rep: Report,
         rep.add_err(f"index.csv missing columns {need}. Has {list(idx.columns)}")
         return
 
-    # open bathy once for resampling checks
     with rasterio.open(bathy_tif) as src:
         nd = src.nodata
 
@@ -284,19 +290,29 @@ def check_transects(transects_dir: str, bathy_tif: str, rep: Report,
             if not np.all(np.diff(s) > 0):
                 bad.append((tid, "s_not_strictly_increasing"))
 
-            # offshore direction check: depth should get more negative going offshore
+            # offshore direction: robust to shelves/platforms
             def mean_depth(lo, hi):
                 m = (s >= lo) & (s <= hi) & np.isfinite(z)
                 return float(np.nanmean(z[m])) if np.any(m) else np.nan
 
             z0 = mean_depth(0, offshore_eps_m)
-            zfar = mean_depth(offshore_test_m - offshore_eps_m, offshore_test_m + offshore_eps_m)
+            smax = float(np.nanmax(s)) if np.any(np.isfinite(s)) else np.nan
+            tests = [t for t in offshore_tests_m if np.isfinite(smax) and (t + offshore_eps_m) <= smax]
 
-            if np.isfinite(z0) and np.isfinite(zfar):
-                if not (zfar < z0):
-                    bad.append((tid, f"not_offshore? z0={z0:.1f} z{int(offshore_test_m)}={zfar:.1f}"))
+            z_tests = []
+            for t in tests:
+                zt = mean_depth(t - offshore_eps_m, t + offshore_eps_m)
+                z_tests.append((t, zt))
 
-            # depth consistency: resample bathy at transect points
+            if np.isfinite(z0) and z_tests:
+                ok_offshore = any(np.isfinite(zt) and (zt <= (z0 - float(deepen_tol_m))) for _, zt in z_tests)
+                if not ok_offshore:
+                    t_last, z_last = z_tests[-1]
+                    bad.append(
+                        (tid, f"not_offshore? z0={z0:.1f} z{int(t_last)}={z_last:.1f} (tol={deepen_tol_m}m)")
+                    )
+
+            # depth consistency (transect depth vs bathy sample)
             zs = sample(df["x"].to_numpy(float), df["y"].to_numpy(float))
             m = np.isfinite(z) & np.isfinite(zs)
             if m.sum() >= 20:
@@ -321,11 +337,12 @@ def check_transects(transects_dir: str, bathy_tif: str, rep: Report,
         if len(rmse_bad) == 0:
             rep.add_ok(f"Depth column matches resampled bathy (RMSE <= {rmse_tol})")
         else:
-            rep.add_warn(f"Depth mismatch vs bathy sampling: {len(rmse_bad)} transects RMSE>{rmse_tol} (up to 12): {rmse_bad[:12]}")
+            rep.add_warn(
+                f"Depth mismatch vs bathy sampling: {len(rmse_bad)} transects RMSE>{rmse_tol} (up to 12): {rmse_bad[:12]}"
+            )
 
 
 def check_mc_outputs(transects_dir: str, rep: Report) -> None:
-    # check both all + regional
     patterns = {
         "trans_all": os.path.join(transects_dir, "tr_*_grilli_mcs.csv"),
         "rot_all": os.path.join(transects_dir, "tr_*_grilli_rot_mcs.csv"),
@@ -379,16 +396,44 @@ def check_mc_outputs(transects_dir: str, rep: Report) -> None:
             e = np.concatenate(e_all)
             out[name]["eta0_stats"] = {
                 "n": int(e.size),
+                "p50": float(np.quantile(e, 0.50)),
                 "p95": float(np.quantile(e, 0.95)),
                 "p99": float(np.quantile(e, 0.99)),
                 "max": float(e.max()),
             }
 
-        # warnings
         if out[name]["empty"]:
             rep.add_warn(f"{name}: empty/bad CSVs: {len(out[name]['empty'])} (ex: {out[name]['empty'][:5]})")
         if out[name]["missing_cols"]:
-            rep.add_warn(f"{name}: missing required columns in {len(out[name]['missing_cols'])} files (ex: {out[name]['missing_cols'][:3]})")
+            rep.add_warn(
+                f"{name}: missing required columns in {len(out[name]['missing_cols'])} files (ex: {out[name]['missing_cols'][:3]})"
+            )
+
+    # --- unit-consistency hint: compare *_all vs *_reg if both exist
+    def _maybe_warn_units(kind: str):
+        a = out.get(f"{kind}_all", {}).get("eta0_stats", None)
+        b = out.get(f"{kind}_reg", {}).get("eta0_stats", None)
+        if not (a and b):
+            return
+        p50_all = a.get("p50", np.nan)
+        p50_reg = b.get("p50", np.nan)
+        if not (np.isfinite(p50_all) and np.isfinite(p50_reg) and p50_reg > 0):
+            return
+
+        ratio = float(p50_all / p50_reg)
+        rep.metrics[f"eta0_p50_ratio_{kind}_all_over_reg"] = ratio
+
+        if 50.0 <= ratio <= 200.0:
+            rep.add_warn(
+                f"eta0 unit mismatch likely for '{kind}': median eta0(all)/eta0(reg) ~ {ratio:.1f}. "
+                f"Looks like ALL may be in cm while REGIONAL is in m."
+            )
+
+        if np.isfinite(p50_all) and p50_all > 50.0:
+            rep.add_warn(f"'{kind}_all' eta0 median is {p50_all:.2f} (very large) — check units / file type.")
+
+    _maybe_warn_units("trans")
+    _maybe_warn_units("rot")
 
     rep.metrics["mc_outputs"] = out
     rep.add_ok("MC outputs scan completed (see metrics.mc_outputs for details).")
@@ -439,14 +484,16 @@ def check_summary(summary_csv: str, rep: Report) -> None:
     if viol == 0:
         rep.add_ok("Pf_any monotonic with RP (no violations).")
     else:
-        rep.add_warn(f"Pf_any monotonic violations: {viol} (can happen with missing sampling, but large counts are suspicious).")
+        rep.add_warn(
+            f"Pf_any monotonic violations: {viol} (can happen with missing sampling, but large counts are suspicious)."
+        )
 
     # Monotonic PGA mean with RP (any)
     viol_pga = 0
     pga_cols = [f"pga{rp}_g_center_mean_any" for rp in rps if f"pga{rp}_g_center_mean_any" in df.columns]
     for i in range(len(pga_cols) - 1):
         a = df[pga_cols[i]].to_numpy(float)
-        b = df[pga_cols[i+1]].to_numpy(float)
+        b = df[pga_cols[i + 1]].to_numpy(float)
         m = np.isfinite(a) & np.isfinite(b)
         viol_pga += int(np.sum(b[m] < a[m] - 1e-9))
     rep.metrics["PGA_monotonic_violations_any"] = int(viol_pga)
@@ -464,6 +511,117 @@ def check_summary(summary_csv: str, rep: Report) -> None:
             pf_stats[rp] = {"min": float(np.nanmin(v)), "p50": float(np.nanmedian(v)), "max": float(np.nanmax(v))}
     rep.metrics["summary_pf_any_stats"] = pf_stats
 
+    # -------------------------
+    # Hazard sanity checks (if present)
+    # -------------------------
+    cols = list(df.columns)
+
+    # helper: "050cm" -> 0.5
+    def _tag_cm_to_m(tag: str) -> float:
+        try:
+            return float(int(tag.replace("cm", ""))) / 100.0
+        except Exception:
+            return np.nan
+
+    # (i) PfH ordering vs Pf and PfT (when available)
+    pfh_re = re.compile(r"^PfH(\d+cm)_(\d+)_([a-z]+)$")  # PfH050cm_100_any
+    pfh_defs = []  # (tag, rp, typ, col)
+    tags = set()
+
+    for c in cols:
+        m = pfh_re.match(c)
+        if m:
+            tag, rp, typ = m.group(1), m.group(2), m.group(3)
+            tags.add(tag)
+            pfh_defs.append((tag, rp, typ, c))
+
+    if pfh_defs:
+        viol_order = 0
+
+        # eta_min is stored in summary (your step 5 writes eta_min_m)
+        eta_min_arr = df["eta_min_m"].to_numpy(float) if "eta_min_m" in df.columns else None
+
+        for tag, rp, typ, c_pfh in pfh_defs:
+            c_pf = f"Pf_{rp}_{typ}"
+            c_pft = f"PfT_{rp}_{typ}"
+            if (c_pf not in df.columns) or (c_pft not in df.columns):
+                continue
+
+            pf = df[c_pf].to_numpy(float)
+            pft = df[c_pft].to_numpy(float)
+            pfh = df[c_pfh].to_numpy(float)
+
+            # always enforce PfT <= Pf
+            m0 = np.isfinite(pf) & np.isfinite(pft)
+            viol_order += int(np.sum(pft[m0] > pf[m0] + 1e-12))
+
+            # only enforce PfH <= PfT if H >= eta_min (otherwise PfH can be larger)
+            Hm = _tag_cm_to_m(tag)
+            if np.isfinite(Hm):
+                if eta_min_arr is not None:
+                    m1 = np.isfinite(pfh) & np.isfinite(pft) & np.isfinite(eta_min_arr) & (Hm >= (eta_min_arr - 1e-12))
+                else:
+                    m1 = np.isfinite(pfh) & np.isfinite(pft)
+                viol_order += int(np.sum(pfh[m1] > pft[m1] + 1e-12))
+
+        rep.metrics["PfH_PfT_Pf_order_violations"] = int(viol_order)
+        if viol_order == 0:
+            rep.add_ok("Hazard ordering OK where available: PfT <= Pf (and PfH <= PfT when H >= eta_min).")
+        else:
+            rep.add_warn(f"Hazard ordering violations: {viol_order}")
+
+    # (ii) RPH ≈ 1/AERH where both exist
+    aerr = 0.0
+    ncheck = 0
+    for c in cols:
+        if c.startswith("AERH") and ("_" in c):
+            c_r = "RPH" + c[len("AERH") :]
+            if c_r in df.columns:
+                a = df[c].to_numpy(float)
+                r = df[c_r].to_numpy(float)
+                m = np.isfinite(a) & (a > 0) & np.isfinite(r)
+                if np.any(m):
+                    err = np.nanmax(np.abs(r[m] - 1.0 / a[m]))
+                    aerr = max(aerr, float(err))
+                    ncheck += 1
+
+    rep.metrics["RPH_reciprocal_max_abs_err"] = float(aerr) if ncheck else np.nan
+    if ncheck:
+        if aerr < 1e-6:
+            rep.add_ok(f"RPH reciprocal check OK (max |RPH-1/AERH|={aerr:.2e})")
+        else:
+            rep.add_warn(f"RPH reciprocal check: max |RPH-1/AERH|={aerr:.2e} (should be tiny)")
+
+    # (iii) If multiple thresholds exist: PfH decreases with higher threshold
+    if len(tags) >= 2 and pfh_defs:
+        tag_m = sorted([(t, _tag_cm_to_m(t)) for t in tags], key=lambda x: x[1])
+        tag_m = [(t, m) for (t, m) in tag_m if np.isfinite(m)]
+        if len(tag_m) >= 2:
+            group = {}
+            for tag, rp, typ, col in pfh_defs:
+                group.setdefault((rp, typ), {})[tag] = col
+
+            viol_thr = 0
+            for (rp, typ), dct in group.items():
+                for i in range(len(tag_m) - 1):
+                    t1, _ = tag_m[i]
+                    t2, _ = tag_m[i + 1]
+                    c1 = dct.get(t1, None)
+                    c2 = dct.get(t2, None)
+                    if (c1 is None) or (c2 is None):
+                        continue
+                    v1 = df[c1].to_numpy(float)
+                    v2 = df[c2].to_numpy(float)
+                    m = np.isfinite(v1) & np.isfinite(v2)
+                    # higher threshold (t2) should not exceed lower (t1)
+                    viol_thr += int(np.sum(v2[m] > v1[m] + 1e-12))
+
+            rep.metrics["PfH_threshold_monotonic_violations"] = int(viol_thr)
+            if viol_thr == 0:
+                rep.add_ok("PfH threshold monotonicity OK (higher H => lower/equal PfH)")
+            else:
+                rep.add_warn(f"PfH threshold monotonicity violations: {viol_thr}")
+
 
 def make_plots(cfg: Dict[str, Any], resolved: Dict[str, Any], rep: Report) -> None:
     if plt is None:
@@ -474,7 +632,6 @@ def make_plots(cfg: Dict[str, Any], resolved: Dict[str, Any], rep: Report) -> No
     sanity_dir = os.path.join(out_dir, "_sanity")
     os.makedirs(sanity_dir, exist_ok=True)
 
-    # Summary histograms (Pf_any for largest RP + eta0 for largest RP if exists)
     summ = resolved["summary_csv"]
     df = _safe_read_csv(summ)
     if df is None:
@@ -503,7 +660,6 @@ def make_plots(cfg: Dict[str, Any], resolved: Dict[str, Any], rep: Report) -> No
             plt.close()
             rep.add_ok(f"Wrote plot: {p}")
 
-    # Eta0 histogram: pick eta0_fail{rpmax}_p99_m_any if exists else any eta0_fail
     eta_col = f"eta0_fail{rp_max}_p99_m_any"
     if eta_col not in df.columns:
         for c in df.columns:
@@ -525,7 +681,6 @@ def make_plots(cfg: Dict[str, Any], resolved: Dict[str, Any], rep: Report) -> No
             plt.close()
             rep.add_ok(f"Wrote plot: {p}")
 
-    # Pf vs PGA scatter for rp_max if available
     pga_col = f"pga{rp_max}_g_center_mean_any"
     if pf_col in df.columns and pga_col in df.columns:
         x = df[pga_col].to_numpy(float)
@@ -564,20 +719,16 @@ def main():
     if resolved:
         check_crs_and_bounds(resolved["bathy"], resolved.get("coast_shp", None), rep)
 
-        # Transects checks depend on bathy + transects_dir
         if os.path.exists(resolved["transects_dir"]) and os.path.exists(resolved["bathy"]):
             check_transects(resolved["transects_dir"], resolved["bathy"], rep, rmse_tol=float(args.rmse_tol))
         else:
             rep.add_warn("Skipping transect checks (missing transects_dir or bathy).")
 
-        # MC outputs
         if os.path.exists(resolved["transects_dir"]):
             check_mc_outputs(resolved["transects_dir"], rep)
 
-        # Summary
         check_summary(resolved["summary_csv"], rep)
 
-        # Plots
         if args.plots:
             make_plots(cfg, resolved, rep)
 
@@ -613,10 +764,7 @@ def main():
         else:
             out_json = os.path.join(os.getcwd(), "sanity_report.json")
         with open(out_json, "w") as f:
-            json.dump(
-                {"ok": rep.ok, "warn": rep.warn, "err": rep.err, "metrics": rep.metrics},
-                f, indent=2
-            )
+            json.dump({"ok": rep.ok, "warn": rep.warn, "err": rep.err, "metrics": rep.metrics}, f, indent=2)
         print("\n[OK] wrote JSON report:", out_json)
     except Exception as e:
         print("\n[WARN] could not write JSON report:", e)
