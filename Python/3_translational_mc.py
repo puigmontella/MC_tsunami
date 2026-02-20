@@ -1,323 +1,412 @@
 #!/usr/bin/env python3
+import os
+import sys
+import glob
+import json
 import argparse
 import numpy as np
 import pandas as pd
-from pathlib import Path
+from joblib import Parallel, delayed
 
-# ----------------------------
-# Grilli-style MCS (TRANSLATIONAL)
-# ----------------------------
-# Uses:
-#  - Infinite-slope pseudo-static FS (Eq. 7)
-#  - Ru sampling (Eqs. 13–15)
-#  - Geometry ranges (Table 1 ranges) + lognormal fits (Figs. 11–13) as defaults
-#
-# Output:
-#  - A CSV of accepted trials, including k_crit (critical pseudo-static coefficient)
-#  - Some summary stats
+# -----------------------------
+# Project root on PYTHONPATH
+# -----------------------------
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+sys.path.append(PROJECT_ROOT)
 
-RHO_W = 1025.0  # kg/m3 (sea water)
+from utilities.stats import (
+    trunc_normal,
+    trunc_lognormal,
+    parse_transect_id,
+    find_col,
+    beta_from_segment,
+)
 
-def lognormal_mu_sigma(mean, std):
-    """Convert mean/std in linear space to mu/sigma of underlying lognormal."""
-    mean = float(mean); std = float(std)
-    var = std**2
-    sigma2 = np.log(1.0 + var/(mean**2))
-    sigma = np.sqrt(sigma2)
-    mu = np.log(mean) - 0.5*sigma2
-    return mu, sigma
+from utilities.failure_tools import (
+    sample_Rut,
+    kcrit_translational,
+    eta0_translational_eq18,
+)
 
-def sample_lognormal_trunc(rng, mean, std, vmin, vmax, max_tries=10000):
-    """Scalar truncated lognormal by rejection sampling."""
-    mu, sig = lognormal_mu_sigma(mean, std)
-    for _ in range(max_tries):
-        x = rng.lognormal(mu, sig)
-        if (x >= vmin) and (x <= vmax):
-            return float(x)
-    return None
+# -----------------------------
+# Defaults (fallback if params missing)
+# -----------------------------
+DEFAULTS = dict(
+    d0=dict(mean=1247.0, std=485.0, min=50.0, max=4000.0),
+    L=dict(mean=5749.0, std=3024.0, min=200.0, max=30000.0),
+    T=dict(mode="ratio", tl_min=0.01, tl_max=0.08, min_m=1.0, max_m=500.0),
+    phi=dict(mean=32.0, std=4.0, min=20.0, max=45.0),
+    rho=dict(mean=1816.6, std=39.9, min=1400.0, max=2200.0),
+    ru=dict(eps_t=0.5, r_gauss_std=0.25),
+    width=dict(w_min=0.20, w_max=0.30),
+    geometry=dict(max_attempts_factor=40),
+)
 
-def compute_beta_from_segment(s_seg, d_seg):
-    """
-    Robust slope angle beta from linear fit of depth (positive) vs distance.
-    beta = atan(dd/ds)
-    """
-    if len(s_seg) < 3:
+# -----------------------------
+# Small helpers
+# -----------------------------
+def _load_json(path):
+    with open(path, "r") as f:
+        return json.load(f)
+
+def _resolve_path(p):
+    """Resolve relative paths against PROJECT_ROOT."""
+    if p is None:
         return None
-    # least-squares slope
-    s0 = s_seg - s_seg.mean()
-    d0 = d_seg - d_seg.mean()
-    denom = np.dot(s0, s0)
-    if denom <= 0:
-        return None
-    m = np.dot(s0, d0) / denom  # dd/ds
-    beta = np.arctan(m)         # radians
-    return float(beta)
+    return p if os.path.isabs(p) else os.path.abspath(os.path.join(PROJECT_ROOT, p))
 
-def pick_start_index_for_depth(rng, s, depth_pos, d_target, L_target, tol_list=(20, 50, 100, 200, 300)):
+def _get(d, keys, default=None):
+    """Safe nested get: keys can be ['a','b','c']."""
+    cur = d
+    for k in keys:
+        if not isinstance(cur, dict) or k not in cur:
+            return default
+        cur = cur[k]
+    return cur
+
+def _merge_defaults(user_params, defaults):
+    """Shallow-ish merge for our known structure."""
+    out = dict(defaults)
+    for k, v in (user_params or {}).items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            tmp = dict(out[k])
+            tmp.update(v)
+            out[k] = tmp
+        else:
+            out[k] = v
+    return out
+
+def _load_transect(path):
+    dfT = pd.read_csv(path)
+
+    s_col = find_col(dfT, ["s_m", "dist_m", "distance_m", "s"])
+    z_col = find_col(dfT, ["depth", "depth_m", "z", "bathy_m"])
+
+    if s_col is None or z_col is None:
+        raise RuntimeError(
+            "{} missing s/depth columns. Found: {}".format(os.path.basename(path), list(dfT.columns))
+        )
+
+    s_all = dfT[s_col].to_numpy(float)
+    z_all = dfT[z_col].to_numpy(float)  # expected negative offshore
+
+    m = np.isfinite(s_all) & np.isfinite(z_all)
+    s_all = s_all[m]
+    z_all = z_all[m]
+    if len(s_all) < 5:
+        return None, None
+
+    order = np.argsort(s_all)
+    s_all = s_all[order]
+    z_all = z_all[order]
+    return s_all, z_all
+
+def _sample_thickness_T(rng, T_cfg, L_eff):
     """
-    Pick a start index i such that depth_pos[i] ~ d_target within tolerance,
-    and enough room remains to fit L_target.
+    Supported:
+      T.mode = 'ratio' with tl_min/tl_max (T = tl * L_eff)
+      T.mode = 'uniform' with min_m/max_m (T ~ U[min_m, max_m])
+      T.mode = 'fixed' with value_m
     """
-    smax = s[-1]
-    for tol in tol_list:
-        candidates = np.where(
-            (np.abs(depth_pos - d_target) <= tol) &
-            (s <= smax - L_target)
-        )[0]
-        if len(candidates) > 0:
-            return int(rng.choice(candidates))
-    return None
+    mode = str(T_cfg.get("mode", "ratio")).lower()
 
-def ru_translational_grilli(rng, beta_deg, phi_deg, eps=0.5):
-    """
-    Grilli translational Ru (Eqs. 13–15):
-      Rut = rtV + alpha_t (rt - rtV), alpha_t = R + eps, -1<=alpha_t<=1
-      rtV = 0.9 - 0.03 beta
-      rt  = 0.991 - 0.033 beta + 0.0003/phi
-    R ~ N(0, 0.25)
-    """
-    R = rng.normal(0.0, 0.25)
-    alpha_t = np.clip(R + eps, -1.0, 1.0)
+    if mode == "ratio":
+        tl_min = float(T_cfg.get("tl_min", 0.01))
+        tl_max = float(T_cfg.get("tl_max", 0.08))
+        tl = float(rng.uniform(tl_min, tl_max))
+        T = tl * float(L_eff)
+    elif mode == "uniform":
+        mn = float(T_cfg.get("min_m", 1.0))
+        mx = float(T_cfg.get("max_m", 500.0))
+        T = float(rng.uniform(mn, mx))
+    elif mode == "fixed":
+        T = float(T_cfg.get("value_m", 50.0))
+    else:
+        # fallback
+        tl = float(rng.uniform(0.01, 0.08))
+        T = tl * float(L_eff)
 
-    rtV = 0.9   - 0.03  * beta_deg
-    rt  = 0.991 - 0.033 * beta_deg + 0.0003 / max(phi_deg, 1e-6)
+    # optional clipping
+    if "min_m" in T_cfg:
+        T = max(T, float(T_cfg["min_m"]))
+    if "max_m" in T_cfg:
+        T = min(T, float(T_cfg["max_m"]))
 
-    Rut = rtV + alpha_t * (rt - rtV)
+    return float(T)
 
-    # Physical bounds used in paper discussion (and to avoid nonsense)
-    Rut = np.clip(Rut, 0.0, min(float(rt), 0.99))
-    return float(Rut)
+# -----------------------------
+# Core MC
+# -----------------------------
+def run_trans_mc_for_transect(
+    transect_csv,
+    n_trials,
+    seed,
+    keep_fs_checks,
+    out_fmt,
+    params,
+    verbose=False,
+):
+    tid = parse_transect_id(transect_csv)
 
-def fs_translational(beta, phi, s_spec, Ru, k):
-    """
-    Grilli translational infinite-slope pseudo-static FS (Eq. 7 form consistent with checker):
-    FS = tan(phi) * [ (s-1)(1-Ru) - k*s*tan(beta) ] / [ (s-1)*tan(beta) + k*s ]
-    """
-    tb = np.tan(beta)
-    tp = np.tan(phi)
-    num = tp * ((s_spec - 1.0) * (1.0 - Ru) - k * s_spec * tb)
-    den = (s_spec - 1.0) * tb + k * s_spec
-    if den == 0:
-        return np.nan
-    return float(num / den)
+    s_all, z_all = _load_transect(transect_csv)
+    if s_all is None:
+        return (tid, 0, 0)
 
-
-def kcrit_from_fs1(beta, phi, s_spec, Ru):
-    """
-    Solve FS=1 for k using the FS definition above.
-
-    From:
-      1 = tan(phi)*[(s-1)(1-Ru) - k*s*tan(beta)] / [(s-1)*tan(beta) + k*s]
-
-    => k = (s-1)[ tan(phi)*(1-Ru) - tan(beta) ] / [ s( tan(phi)*tan(beta) + 1 ) ]
-    """
-    tb = np.tan(beta)
-    tp = np.tan(phi)
-    den = s_spec * (tp * tb + 1.0)
-    if den == 0:
-        return np.nan
-    k = (s_spec - 1.0) * (tp * (1.0 - Ru) - tb) / den
-    return float(k)
-
-
-def width_translational_grilli(rng, L):
-    """
-    Grilli width rule (Eqs. 16–17 text):
-    translational width ~ 25% of length with ±20% variability.
-    Implemented as: w = (0.2 + 0.1*R)*L, R~U[0,1]
-    (This matches 0.25 ± 20% => [0.2, 0.3].)
-    """
-    R = rng.random()
-    return float((0.2 + 0.1 * R) * L)
-
-def eta0_translational_grilli(beta, T, L, d_center, s_spec, w):
-    """
-    Eq. (18) + (20) + (22):
-      SoT = (pi/2) * L * (s+1)
-      lambda0T = sqrt( (pi*L*d*(s+1)^2)/(2*sin(beta)) * ((s-1)/s) )
-      eta0T = SoT*(0.0574 - 0.0431*sin(beta))*(T/L)*(L*sin(beta)/d)^1.25
-              * (1-exp(-2.2*(s-1))) * w/(w + lambda0T)
-    """
-    sb = np.sin(beta)
-    if sb <= 0 or d_center <= 0 or L <= 0:
-        return np.nan
-
-    SoT = 0.5 * np.pi * L * (s_spec + 1.0)
-    lambda0T = np.sqrt(
-        (np.pi * L * d_center * (s_spec + 1.0)**2) / (2.0 * sb) * ((s_spec - 1.0) / s_spec)
-    )
-
-    coef = (0.0574 - 0.0431 * sb)
-    term1 = (T / L)
-    term2 = (L * sb / d_center) ** 1.25
-    term3 = (1.0 - np.exp(-2.2 * (s_spec - 1.0)))
-    term4 = w / (w + lambda0T)
-
-    eta0 = SoT * coef * term1 * term2 * term3 * term4
-    return float(eta0)
-
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("transect_csv", help="e.g. transects/tr_0014.csv")
-    ap.add_argument("--n", type=int, default=200000, help="number of MCS trials")
-    ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--out", default=None, help="output csv path (default: alongside input)")
-    ap.add_argument("--keep_fs_checks", action="store_true",
-                    help="Keep only trials passing FS1>1 and FS2>1 checks (recommended)")
-    # Geometry distributions: default from Grilli validation fits (Figs. 12-13)
-    ap.add_argument("--d_mean", type=float, default=1247.0, help="depth mean (m)")
-    ap.add_argument("--d_std",  type=float, default=485.0,  help="depth std (m)")
-    ap.add_argument("--L_mean", type=float, default=5749.0, help="length mean (m)")
-    ap.add_argument("--L_std",  type=float, default=3024.0, help="length std (m)")
-    ap.add_argument("--d_min", type=float, default=120.0)
-    ap.add_argument("--d_max", type=float, default=2500.0)
-    ap.add_argument("--L_min", type=float, default=1000.0)
-    ap.add_argument("--L_max", type=float, default=50000.0)
-    # Thickness ratio range (Table 1 for translational)
-    ap.add_argument("--T_over_L_min", type=float, default=0.01)
-    ap.add_argument("--T_over_L_max", type=float, default=0.04)
-    # Sediment density (Fig. 11 fit)
-    ap.add_argument("--rho_mean", type=float, default=1816.6)
-    ap.add_argument("--rho_std",  type=float, default=39.9)
-    # Phi' prior (edit for Tenerife if you later have constraints)
-    ap.add_argument("--phi_mean", type=float, default=31.7)
-    ap.add_argument("--phi_std",  type=float, default=2.0)
-    ap.add_argument("--phi_min",  type=float, default=28.0)
-    ap.add_argument("--phi_max",  type=float, default=40.0)
-    args = ap.parse_args()
-
-    tr_path = Path(args.transect_csv)
-    df = pd.read_csv(tr_path)
-
-    if not {"s_m", "depth"}.issubset(df.columns):
-        raise ValueError("Transect CSV must have at least columns: s_m, depth")
-
-    s = df["s_m"].to_numpy(float)
-    depth = df["depth"].to_numpy(float)        # negative in your files
-    depth_pos = -depth                         # positive depth below sea level (m)
-
-    # basic cleaning
-    m = np.isfinite(s) & np.isfinite(depth_pos)
-    s = s[m]; depth_pos = depth_pos[m]
-    if len(s) < 10:
-        raise ValueError("Transect too short after cleaning.")
-
-    rng = np.random.default_rng(args.seed)
+    depth_pos_all = -z_all  # positive depth for placement
+    rng = np.random.default_rng(int(seed + tid * 10007))
 
     out_rows = []
-    n_attempt = 0
-    n_accept = 0
+    attempts = 0
+    max_attempts = int(n_trials * float(params["geometry"].get("max_attempts_factor", 40)))
 
-    for it in range(args.n):
-        n_attempt += 1
+    s_min = float(s_all[0])
+    s_max = float(s_all[-1])
 
-        # sample depth & length (truncated lognormal)
-        d0 = sample_lognormal_trunc(rng, args.d_mean, args.d_std, args.d_min, args.d_max)
-        L  = sample_lognormal_trunc(rng, args.L_mean, args.L_std, args.L_min, args.L_max)
-        if (d0 is None) or (L is None):
+    d0_cfg = params["d0"]
+    L_cfg  = params["L"]
+    T_cfg  = params["T"]
+    phi_cfg = params["phi"]
+    rho_cfg = params["rho"]
+    ru_cfg  = params["ru"]
+    w_cfg   = params["width"]
+
+    eps_t = float(ru_cfg.get("eps_t", 0.5))
+    r_gauss_std = float(ru_cfg.get("r_gauss_std", 0.25))
+    w_min = float(w_cfg.get("w_min", 0.20))
+    w_max = float(w_cfg.get("w_max", 0.30))
+
+    while (len(out_rows) < n_trials) and (attempts < max_attempts):
+        attempts += 1
+
+        # ---- priors
+        d0 = trunc_lognormal(rng, float(d0_cfg["mean"]), float(d0_cfg["std"]), float(d0_cfg["min"]), float(d0_cfg["max"]))
+        L  = trunc_lognormal(rng, float(L_cfg["mean"]),  float(L_cfg["std"]),  float(L_cfg["min"]),  float(L_cfg["max"]))
+
+        phi_deg = trunc_normal(rng, float(phi_cfg["mean"]), float(phi_cfg["std"]), float(phi_cfg["min"]), float(phi_cfg["max"]))
+        rho_s   = trunc_normal(rng, float(rho_cfg["mean"]), float(rho_cfg["std"]), float(rho_cfg["min"]), float(rho_cfg["max"]))
+
+        # ---- place slide: must fit s0 + L <= s_max
+        max_s0 = s_max - L
+        if max_s0 <= s_min:
             continue
 
-        i0 = pick_start_index_for_depth(rng, s, depth_pos, d0, L)
-        if i0 is None:
+        cand = np.where(s_all <= max_s0)[0]
+        if cand.size < 5:
             continue
 
-        s_end = s[i0] + L
-        i1 = int(np.searchsorted(s, s_end, side="left"))
-        if i1 >= len(s):
-            continue
-        if i1 <= i0 + 2:
-            continue
+        i0 = int(cand[np.argmin(np.abs(depth_pos_all[cand] - d0))])
+        s0 = float(s_all[i0])
 
-        # actual realized length
-        L_eff = float(s[i1] - s[i0])
-
-        # slope angle beta from segment
-        beta = compute_beta_from_segment(s[i0:i1+1], depth_pos[i0:i1+1])
-        if beta is None or not np.isfinite(beta):
-            continue
-        beta_deg = np.degrees(beta)
-
-        # sample phi', rho_s
-        phi_deg = float(np.clip(rng.normal(args.phi_mean, args.phi_std), args.phi_min, args.phi_max))
-        phi = np.radians(phi_deg)
-
-        rho_s = float(rng.normal(args.rho_mean, args.rho_std))
-        rho_s = float(np.clip(rho_s, 1600.0, 2200.0))  # just sanity bounds
-        s_spec = rho_s / RHO_W
-
-        # thickness
-        T_over_L = float(rng.uniform(args.T_over_L_min, args.T_over_L_max))
-        T = T_over_L * L_eff
-
-        # Ru (Grilli translational)
-        Ru = ru_translational_grilli(rng, beta_deg, phi_deg, eps=0.5)
-
-        # Stage checks (Grilli validation logic)
-        FS1 = np.tan(phi) / np.tan(beta) if np.tan(beta) > 0 else np.nan
-        FS2 = (1.0 - Ru) * FS1
-
-        if args.keep_fs_checks:
-            if not (np.isfinite(FS1) and np.isfinite(FS2)):
-                continue
-            if (FS1 <= 1.0) or (FS2 <= 1.0):
-                continue
-
-        # kcrit from FS=1
-        kcrit = kcrit_from_fs1(beta, phi, s_spec, Ru)
-        if not np.isfinite(kcrit):
+        s1_target = s0 + L
+        i1 = int(np.searchsorted(s_all, s1_target, side="left"))
+        if i1 <= i0 + 2 or i1 >= len(s_all):
             continue
 
-        # Depth at slide "center" (for eta0), use midpoint index
-        ic = (i0 + i1) // 2
-        d_center = float(depth_pos[ic])
+        s1 = float(s_all[i1])
+        L_eff = float(s1 - s0)
+        if L_eff <= 0.0:
+            continue
 
-        # width (Grilli rule for translational)
-        w = width_translational_grilli(rng, L_eff)
+        s_seg = s_all[i0:i1+1]
+        zb_seg = z_all[i0:i1+1]  # seabed z (negative)
+        depth_pos_seg = -zb_seg
 
-        # optional eta0 (Grilli)
-        eta0 = eta0_translational_grilli(beta, T, L_eff, d_center, s_spec, w)
+        beta_deg = beta_from_segment(s_seg, depth_pos_seg)
+        if not np.isfinite(beta_deg) or beta_deg <= 0.0:
+            continue
+
+        # ---- thickness uses L_eff (more consistent than sampled L)
+        T = _sample_thickness_T(rng, T_cfg, L_eff)
+
+        # ---- Ru sampling
+        Rut, rVt, rt, alpha_t, Rgauss = sample_Rut(
+            beta_deg=beta_deg,
+            phi_deg=phi_deg,
+            rng=rng,
+            eps_t=eps_t,
+            r_gauss_std=r_gauss_std
+        )
+
+        # ---- FS checks (optional)
+        tb = np.tan(np.radians(beta_deg))
+        tp = np.tan(np.radians(phi_deg))
+        if tb <= 0.0 or not np.isfinite(tb) or not np.isfinite(tp):
+            continue
+
+        FS1 = tp / tb
+        FS2 = (1.0 - Rut) * FS1
+
+        if keep_fs_checks and ((FS1 <= 1.0) or (FS2 <= 1.0)):
+            continue
+
+        # ---- kcrit
+        kcrit, FS0 = kcrit_translational(beta_deg, phi_deg, rho_s, Rut)
+        if not np.isfinite(kcrit) or not np.isfinite(FS0):
+            continue
+
+        # ---- eta0
+        s_center = 0.5 * (s0 + s1)
+        zb_center = float(np.interp(s_center, s_seg, zb_seg))
+        d_center = float(max(1.0, -zb_center))
+
+        w_coeff = float(rng.uniform(w_min, w_max))
+        w = w_coeff * L_eff
+
+        eta0 = eta0_translational_eq18(
+            beta_deg=beta_deg,
+            T=T,
+            l=L_eff,
+            d=d_center,
+            rho_s=rho_s,
+            w=w
+        )
 
         out_rows.append({
-            "trial": it,
-            "i0": i0,
-            "i1": i1,
-            "s0_m": float(s[i0]),
-            "s1_m": float(s[i1]),
+            "transect_id": tid,
+            "trial_id": len(out_rows),
+
+            "s0_m": s0,
+            "s1_m": s1,
+
+            # include both names for convenience downstream
             "L_m": L_eff,
-            "d0_m_target": d0,
-            "d0_m_real": float(depth_pos[i0]),
-            "d_center_m": d_center,
-            "beta_deg": beta_deg,
-            "phi_deg": phi_deg,
-            "rho_s": rho_s,
-            "s_spec": s_spec,
-            "T_m": T,
-            "T_over_L": T_over_L,
-            "Ru": Ru,
+            "L_eff_m": L_eff,
+
+            "d0_m": d0,
+            "beta_deg": float(beta_deg),
+            "phi_deg": float(phi_deg),
+            "rho_s": float(rho_s),
+
+            "Rut": float(Rut),
+            "rVt": float(rVt),
+            "rt": float(rt),
+            "alpha_t": float(alpha_t),
+            "R_gauss": float(Rgauss),
+
             "FS1": float(FS1),
             "FS2": float(FS2),
+            "FS0": float(FS0),
+
             "kcrit": float(kcrit),
-            "w_m": w,
+
+            "T_m": float(T),
+            "w_m": float(w),
+            "d_center_m": float(d_center),
             "eta0_m": float(eta0),
+
+            "failure_type": "trans",
         })
-        n_accept += 1
 
     out = pd.DataFrame(out_rows)
-
-    if args.out is None:
-        out_path = tr_path.with_name(tr_path.stem + "_grilli_mcs.csv")
-    else:
-        out_path = Path(args.out)
-
+    out_path = out_fmt.format(tid=tid)
     out.to_csv(out_path, index=False)
 
-    print(f"[DONE] Attempts: {n_attempt}  Accepted: {n_accept}")
-    print(f"[OUT] {out_path}")
-    if len(out) > 0:
-        print("\n=== kcrit summary ===")
-        print(out["kcrit"].describe(percentiles=[0.05, 0.1, 0.5, 0.9, 0.95]))
-        print("\n=== eta0 summary (m) ===")
-        print(out["eta0_m"].describe(percentiles=[0.5, 0.9, 0.95, 0.99]))
+    if verbose:
+        print("[OK] tr_{:04d}: {} accepted / {} attempts -> {}".format(tid, len(out), attempts, out_path))
+
+    return (tid, int(len(out)), int(attempts))
+
+# -----------------------------
+# Main
+# -----------------------------
+def main():
+    ap = argparse.ArgumentParser(description="Translational (slide) Monte Carlo per transect (kcrit + eta0), driven by config + params JSON.")
+    ap.add_argument("--config", required=True, help="Path to cases/config.json")
+
+    ap.add_argument("--transects-dir", default=None, help="Override transects directory (default from config outputs.transects_dir)")
+    ap.add_argument("--params", default=None, help="Override translational params JSON (default from config paths.parameters.trans)")
+    ap.add_argument("--pattern", default=None, help="Glob for transect CSVs (default: <transects_dir>/tr_*.csv)")
+    ap.add_argument("--out-fmt", default=None, help="Output format (must include {tid:04d}). Default: <transects_dir>/tr_{tid:04d}_grilli_mcs.csv")
+
+    ap.add_argument("--n-trials", type=int, default=5000, help="Accepted trials per transect")
+    ap.add_argument("--seed", type=int, default=1234)
+    ap.add_argument("--keep-fs-checks", action="store_true", help="Keep only FS1>1 and FS2>1")
+
+    ap.add_argument("--n-jobs", type=int, default=1)
+    ap.add_argument("--backend", type=str, default="loky", choices=["loky", "multiprocessing", "threading"])
+    ap.add_argument("--verbose", action="store_true")
+    args = ap.parse_args()
+
+    cfg_path = _resolve_path(args.config)
+    cfg = _load_json(cfg_path)
+
+    transects_dir = args.transects_dir
+    if transects_dir is None:
+        transects_dir = _get(cfg, ["outputs", "transects_dir"], "transects")
+    transects_dir = _resolve_path(transects_dir)
+    os.makedirs(transects_dir, exist_ok=True)
+
+    params_path = args.params
+    if params_path is None:
+        params_path = _get(cfg, ["paths", "parameters", "trans"], None)
+    if params_path is None:
+        raise SystemExit("Config missing paths.parameters.trans (and you didn't pass --params).")
+    params_path = _resolve_path(params_path)
+
+    user_params = _load_json(params_path)
+    params = _merge_defaults(user_params, DEFAULTS)
+
+    out_fmt = args.out_fmt
+    if out_fmt is None:
+        out_fmt = os.path.join(transects_dir, "tr_{tid:04d}_grilli_mcs.csv")
+
+    pattern = args.pattern if args.pattern else os.path.join(transects_dir, "tr_*.csv")
+    files = sorted(glob.glob(pattern))
+
+    # filter out non-transect files (index, maps, MC outputs)
+    clean = []
+    for f in files:
+        b = os.path.basename(f)
+        if b == "index.csv":
+            continue
+        if "_mcs" in b:
+            continue
+        if "transects_over" in b:
+            continue
+        clean.append(f)
+    files = clean
+
+    if not files:
+        raise SystemExit("No transect CSV files found for pattern: {}".format(pattern))
+
+    print("[INFO] translational MC: {} transects, n_trials={}, n_jobs={}, backend={}".format(
+        len(files), args.n_trials, args.n_jobs, args.backend
+    ))
+    print("[INFO] using params:", params_path)
+    print("[INFO] outputs ->", out_fmt)
+
+    if args.n_jobs == 1:
+        tot = 0
+        for f in files:
+            tid, nacc, att = run_trans_mc_for_transect(
+                f,
+                n_trials=args.n_trials,
+                seed=args.seed,
+                keep_fs_checks=args.keep_fs_checks,
+                out_fmt=out_fmt,
+                params=params,
+                verbose=True
+            )
+            tot += nacc
+        print("[DONE] total accepted trials written:", tot)
+        return
+
+    results = Parallel(n_jobs=args.n_jobs, backend=args.backend, verbose=10)(
+        delayed(run_trans_mc_for_transect)(
+            f,
+            n_trials=args.n_trials,
+            seed=args.seed,
+            keep_fs_checks=args.keep_fs_checks,
+            out_fmt=out_fmt,
+            params=params,
+            verbose=args.verbose
+        )
+        for f in files
+    )
+
+    tot = int(sum(nacc for (_, nacc, _) in results))
+    print("[DONE] total accepted trials written:", tot)
+
 
 if __name__ == "__main__":
     main()

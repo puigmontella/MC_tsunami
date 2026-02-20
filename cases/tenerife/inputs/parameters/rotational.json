@@ -1,0 +1,39 @@
+{
+  "d0": { "mean": 1247.0, "std": 485.0, "min": 50.0, "max": 4000.0 },
+
+  "L":  { "mean": 5749.0, "std": 3024.0, "min": 200.0, "max": 30000.0 },
+
+  "T": {
+    "mode": "ratio",
+    "tl_min": 0.05,
+    "tl_max": 0.25,
+    "min_m": 1.0,
+    "max_m": 500.0
+  },
+
+  "rho": { "mean": 1816.6, "std": 39.9, "min": 1400.0, "max": 2200.0 },
+
+  "strength": {
+    "model": "undrained_ratio",
+    "su_ratio": { "mean": 0.207, "std": 0.010, "min": 0.17, "max": 0.24 }
+  },
+
+  "ru": {
+    "model": "gaussian_peak",
+    "eps_r": 0.35,
+    "r_gauss_std": 0.25,
+    "clip_min": 0.0,
+    "clip_max": 0.95
+  },
+
+  "geometry": {
+    "arc_npts": 200,
+    "sagitta_scale": 1.0,
+    "max_attempts_factor": 30
+  },
+
+  "eta0": {
+    "model": "eq19_proxy",
+    "lognormal_sigma": 0.25
+  }
+}

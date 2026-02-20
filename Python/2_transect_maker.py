@@ -1,269 +1,107 @@
 #!/usr/bin/env python3
+import os
+import sys
+
+import argparse
 import numpy as np
 import pandas as pd
 import geopandas as gpd
 import rasterio
-from rasterio.fill import fillnodata
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
 from shapely.ops import linemerge
 from shapely.geometry import Point, LineString, Polygon
-import os
 
-# for smoothing
 from scipy.ndimage import gaussian_filter
 
-# -------------------------
-# INPUTS (edit)
-# -------------------------
-DEPTH_TIF = "../../MC_tsunami_out/bati_32m_and100m_merged_EPSG32628.tif"
-COAST_VEC = "../contourTenerife_v2.shp"   # almost-closed polyline around Tenerife (CLOCKWISE)
+# utilities import (project root)
 
-# Raw rasters
-SLOPE_TIF_RAW = "slope_deg.tif"
-ROUGH_TIF = "roughness_std.tif"
-CLS_TIF   = "substrate_proxy_class.tif"   # 0 sed, 1 rock, 2 unk, nodata=3 
+# project root on PYTHONPATH (so imports work when running from anywhere)
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, ROOT)
 
-plotFlag = True
+from utilities.config import load_config, abspath
+from utilities.geoio import (
+    read_raster1,
+    write_raster1,
+    raster_pixel_size,
+    fill_nans_nearest,
+)
 
-OUT_DIR = "transects"
-os.makedirs(OUT_DIR, exist_ok=True)
 
-# Transect layout
-SPACING_M = 8000
-EPS_M     = 50
-MAX_LEN_M = 14000
-
-# Sampling along transect
-DS_M = 20.0
-DEPTH_LIMIT = -2500
 
 # -------------------------
-# Slope smoothing controls
-# -------------------------
-MAKE_SMOOTH_SLOPE = True
-SMOOTH_M = 200.0  # smoothing length in meters (try 80–150 m)
-SLOPE_TIF_SMOOTH = f"slope_deg_smooth_{int(SMOOTH_M)}m.tif"
-OVERWRITE_SMOOTH = True
-
-# -------------------------
-# Helpers
+# Local helpers
 # -------------------------
 def unit_normals(line, s, eps=50.0):
     """Return (left_normal, right_normal) at curvilinear distance s along a LineString."""
     p0 = line.interpolate(max(0.0, s - eps))
     p1 = line.interpolate(min(line.length, s + eps))
     dx, dy = (p1.x - p0.x), (p1.y - p0.y)
-    n = (dx*dx + dy*dy) ** 0.5
-    if n == 0:
+    n = float(np.hypot(dx, dy))
+    if n == 0.0:
         return None
-    tx, ty = dx/n, dy/n
+    tx, ty = dx / n, dy / n
     return (-ty, tx), (ty, -tx)  # left, right
 
 def sample_points(src, xs, ys):
     """Sample raster; convert nodata to NaN."""
     vals = np.array([v[0] for v in src.sample(list(zip(xs, ys)))], dtype=float)
     nd = src.nodata
-    if nd is not None:
-        if isinstance(nd, float) and np.isnan(nd):
-            # already NaN nodata
-            pass
-        else:
-            vals[vals == nd] = np.nan
+    if nd is not None and not (isinstance(nd, float) and np.isnan(nd)):
+        vals[vals == nd] = np.nan
     return vals
 
-def ensure_smoothed_slope(depth_tif, out_slope_tif, smooth_m=100.0, overwrite=False):
-    """Smooth bathy then compute slope(deg) and save."""
+def compute_smoothed_slope_from_bathy(bathy_tif, out_slope_tif, smooth_m, overwrite=False):
+    """
+    Smooth bathy (Gaussian) then compute slope(deg) from gradients. Writes a slope raster.
+    Uses fill_nans_nearest so smoothing doesn't spread NaNs.
+    """
     if (not overwrite) and os.path.exists(out_slope_tif):
-        print(f"[INFO] Using existing smoothed slope: {out_slope_tif}")
-        return
+        print("[INFO] Using existing smoothed slope:", out_slope_tif)
+        return out_slope_tif
+
+    z, prof, transform = read_raster1(bathy_tif)
+    dx, dy = raster_pixel_size(transform)
+
+    zf = fill_nans_nearest(z)
+    sigma_x = float(smooth_m / dx)
+    sigma_y = float(smooth_m / dy)
+    zs = gaussian_filter(zf, sigma=(sigma_y, sigma_x), mode="nearest")
+
+    dzdy, dzdx = np.gradient(zs, dy, dx)  # (y,x)
+    slope_rad = np.arctan(np.sqrt(dzdx**2 + dzdy**2))
+    slope_deg = np.degrees(slope_rad).astype("float32")
+    slope_deg[np.isnan(z)] = np.nan
+
+    write_raster1(out_slope_tif, slope_deg, prof, nodata=np.nan, dtype="float32")
+    print("[INFO] Wrote smoothed slope ->", out_slope_tif)
+    return out_slope_tif
+
+def force_close_linestring(ls):
+    coords = list(ls.coords)
+    if len(coords) < 4:
+        raise ValueError("Coastline polyline is too short/invalid.")
+    if Point(coords[0]).distance(Point(coords[-1])) > 1e-6:
+        coords.append(coords[0])
+        ls = LineString(coords)
+    return ls
+
+def build_island_polygon(shore):
+    poly = Polygon(shore).buffer(0)
+    if poly.is_empty:
+        raise ValueError("Failed to build island polygon from contour. Check contour geometry.")
+    return poly
+
+def plot_transects_over_bathy(depth_tif, index_csv, out_png, ds_m, title="Transects over bathymetry"):
+    idx = pd.read_csv(index_csv)
 
     with rasterio.open(depth_tif) as src:
-        z = src.read(1).astype(np.float32)
-        profile = src.profile.copy()
-        nod = src.nodata
-
-        # mask nodata
-        if nod is not None:
-            z_mask = (z == nod)
-        else:
-            z_mask = ~np.isfinite(z)
-
-        z = z.astype(np.float32)
-        z[z_mask] = np.nan
-
-        dx = abs(src.transform.a)
-        dy = abs(src.transform.e)
-
-    # Fill nodata (so smoothing doesn’t spread NaNs)
-    # fillnodata expects a mask where 1 indicates "to fill"
-    z_filled = z.copy()
-    if np.isnan(z_filled).any():
-        z_filled = fillnodata(z_filled, mask=np.isnan(z_filled), max_search_distance=50, smoothing_iterations=0)
-
-        # if still NaNs (big gaps), fall back to median
-        if np.isnan(z_filled).any():
-            z_filled[np.isnan(z_filled)] = np.nanmedian(z_filled)
-
-    # Gaussian smoothing in pixel units
-    sigma_x = smooth_m / dx
-    sigma_y = smooth_m / dy
-    z_s = gaussian_filter(z_filled, sigma=(sigma_y, sigma_x), mode="nearest")
-
-    # Slope from gradients
-    dzdy, dzdx = np.gradient(z_s, dy, dx)
-    slope_rad = np.arctan(np.sqrt(dzdx**2 + dzdy**2))
-    slope_deg = np.degrees(slope_rad).astype(np.float32)
-
-    # Put NaN back where original was nodata
-    slope_deg[z_mask] = np.nan
-
-    # Save
-    profile.update(dtype=rasterio.float32, count=1, nodata=np.nan)
-    with rasterio.open(out_slope_tif, "w", **profile) as dst:
-        dst.write(slope_deg, 1)
-
-    print(f"[INFO] Wrote smoothed slope -> {out_slope_tif}")
-
-# -------------------------
-# Make smoothed slope and choose which slope raster to use
-# -------------------------
-if MAKE_SMOOTH_SLOPE:
-    ensure_smoothed_slope(DEPTH_TIF, SLOPE_TIF_SMOOTH, smooth_m=SMOOTH_M, overwrite=OVERWRITE_SMOOTH)
-    SLOPE_TIF = SLOPE_TIF_SMOOTH
-else:
-    SLOPE_TIF = SLOPE_TIF_RAW
-
-# -------------------------
-# Load coast + rasters
-# -------------------------
-coast = gpd.read_file(COAST_VEC)
-
-with rasterio.open(DEPTH_TIF) as tmp:
-    rcrs = tmp.crs
-
-# reproject coast to raster CRS if needed
-if coast.crs != rcrs:
-    coast = coast.to_crs(rcrs)
-
-# merge linework -> pick the longest line around the island
-shore = linemerge(list(coast.geometry))
-if shore.geom_type == "MultiLineString":
-    shore = max(list(shore.geoms), key=lambda g: g.length)
-
-# ---- force-close (your line is "almost closed") ----
-coords = list(shore.coords)
-if len(coords) < 4:
-    raise ValueError("Coastline/contour line is too short or invalid.")
-
-gap = Point(coords[0]).distance(Point(coords[-1]))
-if gap > 1e-6:
-    coords.append(coords[0])
-    shore = LineString(coords)
-
-# polygon used only for sanity flipping
-island_poly = Polygon(shore).buffer(0)
-if island_poly.is_empty:
-    raise ValueError("Failed to build island polygon from contour. Check contour geometry.")
-
-# open rasters once
-zsrc = rasterio.open(DEPTH_TIF)
-ssrc = rasterio.open(SLOPE_TIF)
-rsrc = rasterio.open(ROUGH_TIF)
-csrc = rasterio.open(CLS_TIF)
-
-index_rows = []
-transect_id = 0
-
-# -------------------------
-# Build & sample transects
-# -------------------------
-for s0 in np.arange(0, shore.length, SPACING_M):
-    p = shore.interpolate(s0)
-
-    normals = unit_normals(shore, s0, eps=EPS_M)
-    if normals is None:
-        continue
-    (nxL, nyL), (nxR, nyR) = normals
-
-    # contour CLOCKWISE => sea is on LEFT side
-    nx, ny = nxL, nyL
-
-    # sanity flip: if direction goes inside island, flip it
-    test_d = 200.0
-    if island_poly.contains(Point(p.x + nx*test_d, p.y + ny*test_d)):
-        nx, ny = -nx, -ny
-
-    # sample points along transect
-    npts = int(MAX_LEN_M / DS_M) + 1
-    s_m = np.arange(npts, dtype=float) * DS_M
-    xs = p.x + nx * s_m
-    ys = p.y + ny * s_m
-
-    depth = sample_points(zsrc, xs, ys)
-    slope = sample_points(ssrc, xs, ys)   # now from smoothed slope raster
-    rough = sample_points(rsrc, xs, ys)
-    cls   = sample_points(csrc, xs, ys)
-
-    # Keep contiguous segment from coast until invalid OR deeper than DEPTH_LIMIT
-    keep_idx = []
-    for i in range(npts):
-        if not np.isfinite(depth[i]):
-            break
-        if depth[i] < DEPTH_LIMIT:
-            break
-        keep_idx.append(i)
-
-    if len(keep_idx) < 10:
-        continue
-
-    keep_idx = np.array(keep_idx, dtype=int)
-
-    df = pd.DataFrame({
-        "id": transect_id,
-        "s_m": s_m[keep_idx],
-        "x": xs[keep_idx],
-        "y": ys[keep_idx],
-        "depth": depth[keep_idx],
-        "slope_deg": slope[keep_idx],
-        "rough": rough[keep_idx],
-        "cls": cls[keep_idx].astype("int32"),
-    })
-
-    out_csv = os.path.join(OUT_DIR, f"tr_{transect_id:04d}.csv")
-    df.to_csv(out_csv, index=False)
-
-    index_rows.append({
-        "id": transect_id,
-        "coast_s_m": float(s0),
-        "x0": float(p.x),
-        "y0": float(p.y),
-        "nx": float(nx),
-        "ny": float(ny),
-        "npoints": int(len(keep_idx)),
-        "csv": os.path.basename(out_csv)
-    })
-
-    transect_id += 1
-
-# close rasters
-zsrc.close(); ssrc.close(); rsrc.close(); csrc.close()
-
-# write index file
-index_path = os.path.join(OUT_DIR, "index.csv")
-pd.DataFrame(index_rows).to_csv(index_path, index=False)
-print(f"Saved {len(index_rows)} transects in: {OUT_DIR}")
-
-# -------------------------
-# Plot transects over bathy
-# -------------------------
-if plotFlag:
-    import matplotlib.pyplot as plt
-
-    idx = pd.read_csv(index_path)
-
-    with rasterio.open(DEPTH_TIF) as src:
         data = src.read(1).astype("float32")
         nodata = src.nodata
-        if nodata is not None:
+        if nodata is not None and not (isinstance(nodata, float) and np.isnan(nodata)):
             data[data == nodata] = np.nan
         extent = [src.bounds.left, src.bounds.right, src.bounds.bottom, src.bounds.top]
 
@@ -274,29 +112,271 @@ if plotFlag:
     for r in idx.itertuples(index=False):
         x0, y0 = float(r.x0), float(r.y0)
         nx, ny = float(r.nx), float(r.ny)
-        L = (float(r.npoints) - 1.0) * DS_M
+        L = (float(r.npoints) - 1.0) * float(ds_m)
         x1, y1 = x0 + nx * L, y0 + ny * L
 
-        # draw transect line
         plt.plot([x0, x1], [y0, y1], linewidth=1)
 
-        # label it (slightly offshore so labels don't sit on the coastline)
-        lab_off = 150.0  # meters along transect; adjust (0–300) if you want
+        lab_off = 150.0
         xl = x0 + nx * lab_off
         yl = y0 + ny * lab_off
-
         plt.text(
-            xl, yl, f"{int(r.id)}",
-            fontsize=10, color="k",
+            xl, yl, str(int(r.id)),
+            fontsize=9, color="k",
             ha="center", va="center",
             bbox=dict(boxstyle="round,pad=0.15", facecolor="white", edgecolor="none", alpha=0.7)
         )
 
-
-    plt.title("Transects over bathymetry")
+    plt.title(title)
     plt.xlabel("Easting (m)")
     plt.ylabel("Northing (m)")
     plt.tight_layout()
-    out_png = os.path.join(OUT_DIR, "transects_over_bathy.png")
     plt.savefig(out_png, dpi=300)
-    plt.show()
+    plt.close()
+    print("[OK] wrote", out_png)
+
+def plot_profiles(transects_dir, transect_ids, out_dir, invert_depth=True):
+    os.makedirs(out_dir, exist_ok=True)
+
+    for tid in transect_ids:
+        f = os.path.join(transects_dir, "tr_{:04d}.csv".format(int(tid)))
+        if not os.path.exists(f):
+            print("[SKIP] missing:", f)
+            continue
+
+        df = pd.read_csv(f)
+        if df.empty:
+            continue
+
+        s = df["s_m"].to_numpy(float)
+        depth = df["depth"].to_numpy(float)
+        slope = df.get("slope_deg", pd.Series(np.nan, index=df.index)).to_numpy(float)
+        rough = df.get("rough", pd.Series(np.nan, index=df.index)).to_numpy(float)
+
+        fig, ax = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
+
+        ax[0].plot(s, depth, linewidth=1.5)
+        ax[0].set_ylabel("depth (m)")
+        if invert_depth:
+            ax[0].invert_yaxis()
+        ax[0].grid(True, alpha=0.3)
+        ax[0].set_title("Transect {:04d}".format(int(tid)))
+
+        ax[1].plot(s, slope, linewidth=1.5)
+        ax[1].set_ylabel("slope (deg)")
+        ax[1].grid(True, alpha=0.3)
+
+        ax[2].plot(s, rough, linewidth=1.5)
+        ax[2].set_ylabel("roughness")
+        ax[2].set_xlabel("s along transect (m)")
+        ax[2].grid(True, alpha=0.3)
+
+        fig.tight_layout()
+
+        out_png = os.path.join(out_dir, "profile_tr_{:04d}.png".format(int(tid)))
+        fig.savefig(out_png, dpi=200)
+        plt.close(fig)
+        print("[OK]", out_png)
+
+    print("[DONE] profile plots in", out_dir)
+
+# -------------------------
+# Main
+# -------------------------
+def main():
+    ap = argparse.ArgumentParser(
+        description="Build offshore transects from coastline and sample rasters (depth/slope/rough/class)."
+    )
+    ap.add_argument("--config", required=True, help="Path to case config.json")
+
+    # Optional overrides (otherwise uses config)
+    ap.add_argument("--coast-shp", default=None, help="Override coastline shapefile")
+    ap.add_argument("--depth-tif", default=None, help="Override bathymetry tif")
+    ap.add_argument("--out-dir", default=None, help="Override transects output directory")
+
+    ap.add_argument("--make-smooth-slope", action="store_true",
+                    help="Create a smoothed slope raster from bathy and use it (writes into rasters_dir).")
+    ap.add_argument("--smooth-m", type=float, default=200.0, help="Smoothing length (meters) for smoothed slope.")
+    ap.add_argument("--overwrite-smooth", action="store_true", help="Overwrite existing smoothed slope tif.")
+
+    ap.add_argument("--plot-overview", action="store_true", help="Write transects_over_bathy.png")
+    ap.add_argument("--plot-profiles", action="store_true", help="Write profile PNGs for selected ids.")
+    ap.add_argument("--profile-ids", default="", help="Comma-separated transect IDs for profiles, e.g. '0,13,7,11'")
+    ap.add_argument("--invert-depth", action="store_true", help="Invert depth axis in profiles (0 at top).")
+
+    args = ap.parse_args()
+    cfg = load_config(args.config)
+
+    # ---- paths from config
+    depth_tif = abspath(cfg, cfg["paths"]["bathy_tif"])
+    rasters_dir = abspath(cfg, cfg["outputs"]["rasters_dir"])
+    out_dir = abspath(cfg, cfg["outputs"]["transects_dir"])
+
+    # coastline selection
+    coast_cfg = cfg["paths"].get("coastline", {})
+    coast_source = str(coast_cfg.get("source", "file")).lower()
+    coast_shp = None
+    if coast_source == "file":
+        coast_shp = abspath(cfg, coast_cfg["shp"])
+    else:
+        # "generated" / "bathy" / etc => use generated_out
+        coast_shp = abspath(cfg, coast_cfg["generated_out"])
+
+    # apply optional overrides
+    if args.depth_tif:
+        depth_tif = args.depth_tif
+    if args.coast_shp:
+        coast_shp = args.coast_shp
+    if args.out_dir:
+        out_dir = args.out_dir
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    # rasters produced by step 1
+    slope_tif = os.path.join(rasters_dir, "slope_deg.tif")
+    rough_tif = os.path.join(rasters_dir, "roughness_std.tif")
+    cls_tif   = os.path.join(rasters_dir, "substrate_proxy_class.tif")
+
+    # sanity
+    for p in [depth_tif, coast_shp, slope_tif, rough_tif, cls_tif]:
+        if not os.path.exists(p):
+            raise SystemExit("[ERROR] Missing input: {}".format(p))
+
+    # ---- transect params from config
+    tcfg = cfg.get("transects", {})
+    spacing_m     = float(tcfg.get("spacing_m", 8000.0))
+    eps_m         = float(tcfg.get("eps_m", 50.0))
+    max_len_m     = float(tcfg.get("max_len_m", 14000.0))
+    ds_m          = float(tcfg.get("ds_m", 20.0))
+    depth_limit_m = float(tcfg.get("depth_limit_m", -2500.0))
+
+    # Optional: create smoothed slope and use it instead
+    slope_tif_use = slope_tif
+    if args.make_smooth_slope:
+        slope_tif_smooth = os.path.join(rasters_dir, "slope_deg_smooth_{}m.tif".format(int(args.smooth_m)))
+        compute_smoothed_slope_from_bathy(
+            bathy_tif=depth_tif,
+            out_slope_tif=slope_tif_smooth,
+            smooth_m=float(args.smooth_m),
+            overwrite=args.overwrite_smooth
+        )
+        slope_tif_use = slope_tif_smooth
+
+    # ---- load coast + raster CRS
+    coast = gpd.read_file(coast_shp)
+    with rasterio.open(depth_tif) as tmp:
+        rcrs = tmp.crs
+
+    if coast.crs != rcrs:
+        coast = coast.to_crs(rcrs)
+
+    shore = linemerge(list(coast.geometry))
+    if shore.geom_type == "MultiLineString":
+        shore = max(list(shore.geoms), key=lambda g: g.length)
+
+    shore = force_close_linestring(shore)
+    island_poly = build_island_polygon(shore)
+
+    # ---- open rasters once
+    zsrc = rasterio.open(depth_tif)
+    ssrc = rasterio.open(slope_tif_use)
+    rsrc = rasterio.open(rough_tif)
+    csrc = rasterio.open(cls_tif)
+
+    index_rows = []
+    transect_id = 0
+
+    # ---- build & sample transects
+    for coast_s in np.arange(0.0, shore.length, spacing_m):
+        p = shore.interpolate(float(coast_s))
+
+        normals = unit_normals(shore, float(coast_s), eps=eps_m)
+        if normals is None:
+            continue
+
+        (nxL, nyL), _ = normals
+
+        # Clockwise contour => sea is on LEFT
+        nx, ny = float(nxL), float(nyL)
+
+        # sanity flip: if it goes inside island, flip
+        test_d = 200.0
+        if island_poly.contains(Point(p.x + nx*test_d, p.y + ny*test_d)):
+            nx, ny = -nx, -ny
+
+        npts = int(max_len_m / ds_m) + 1
+        s_m = np.arange(npts, dtype=float) * ds_m
+        xs = p.x + nx * s_m
+        ys = p.y + ny * s_m
+
+        depth = sample_points(zsrc, xs, ys)
+        slope = sample_points(ssrc, xs, ys)
+        rough = sample_points(rsrc, xs, ys)
+        cls   = sample_points(csrc, xs, ys)
+
+        # keep contiguous segment until invalid OR deeper than limit
+        keep_idx = []
+        for i in range(npts):
+            if not np.isfinite(depth[i]):
+                break
+            if depth[i] < depth_limit_m:
+                break
+            keep_idx.append(i)
+
+        if len(keep_idx) < 10:
+            continue
+
+        keep_idx = np.array(keep_idx, dtype=int)
+
+        df = pd.DataFrame({
+            "id": transect_id,
+            "s_m": s_m[keep_idx],
+            "x": xs[keep_idx],
+            "y": ys[keep_idx],
+            "depth": depth[keep_idx],
+            "slope_deg": slope[keep_idx],
+            "rough": rough[keep_idx],
+            "cls": cls[keep_idx].astype("int32"),
+        })
+
+        out_csv = os.path.join(out_dir, "tr_{:04d}.csv".format(transect_id))
+        df.to_csv(out_csv, index=False)
+
+        index_rows.append({
+            "id": transect_id,
+            "coast_s_m": float(coast_s),
+            "x0": float(p.x),
+            "y0": float(p.y),
+            "nx": float(nx),
+            "ny": float(ny),
+            "npoints": int(len(keep_idx)),
+            "csv": os.path.basename(out_csv)
+        })
+
+        transect_id += 1
+
+    zsrc.close(); ssrc.close(); rsrc.close(); csrc.close()
+
+    index_path = os.path.join(out_dir, "index.csv")
+    pd.DataFrame(index_rows).to_csv(index_path, index=False)
+
+    print("[OK] Saved {} transects in: {}".format(len(index_rows), out_dir))
+    print("[OK] index:", index_path)
+
+    # overview plot
+    if args.plot_overview:
+        out_png = os.path.join(out_dir, "transects_over_bathy.png")
+        plot_transects_over_bathy(depth_tif, index_path, out_png, ds_m)
+
+    # profile plots
+    if args.plot_profiles:
+        if args.profile_ids.strip():
+            tids = [int(x) for x in args.profile_ids.split(",") if x.strip() != ""]
+        else:
+            tids = list(range(min(10, len(index_rows))))
+
+        prof_dir = os.path.join(out_dir, "profiles_png")
+        plot_profiles(out_dir, tids, prof_dir, invert_depth=args.invert_depth)
+
+if __name__ == "__main__":
+    main()
