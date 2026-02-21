@@ -1,34 +1,22 @@
 {
-  "d0": { "mean": 1247.0, "std": 485.0, "min": 50.0, "max": 4000.0 },
+  "d0": { "mean": 1247.0, "std": 485.0, "min": 50.0, "max": 2500.0 },
+  "L":  { "mean": 5749.0, "std": 3024.0, "min": 200.0, "max": 9000.0 },
 
-  "L":  { "mean": 5749.0, "std": 3024.0, "min": 200.0, "max": 30000.0 },
+  "T": { "mode": "ratio", "tl_min": 0.01, "tl_max": 0.08, "min_m": 5.0, "max_m": 200.0 },
 
-  "T": {
-    "mode": "ratio",
-    "tl_min": 0.01,
-    "tl_max": 0.08,
-    "min_m": 5.0,
-    "max_m": 200.0
-  },
+  "phi": { "mean": 18.0, "std": 3.0, "min": 8.0, "max": 30.0 },
 
   "rho": { "mean": 1816.6, "std": 39.9, "min": 1400.0, "max": 2200.0 },
 
-  "strength": {
-    "model": "friction",
-    "phi_deg": { "mean": 18.0, "std": 3.0, "min": 8.0, "max": 30.0 },
-    "cohesion_kpa": { "mean": 0.0, "std": 0.0, "min": 0.0, "max": 0.0 }
-  },
+  "ru": { "eps_t": 0.5, "r_gauss_std": 0.25 },
+  "width": { "w_min": 0.20, "w_max": 0.30 },
+  "geometry": { "max_attempts_factor": 40 },
 
-  "ru": {
-    "model": "gaussian_peak",
-    "eps_r": 0.35,
-    "r_gauss_std": 0.25,
-    "clip_min": 0.0,
-    "clip_max": 0.95
-  },
-
-  "eta0": {
-    "model": "eq_proxy",
-    "lognormal_sigma": 0.25
+  "failure": {
+    "_comment": "Use kcrit_threshold for Grilli; use newmark_rs2009 to activate Newmark in your current scripts.",
+    "mode": "newmark_rs2009",
+    "duration_s": { "dist": "lognormal", "median": 20.0, "sigma_ln": 0.6, "min": 5.0, "max": 120.0 },
+    "Dcrit_m":     { "dist": "lognormal", "median": 2.0,  "sigma_ln": 0.7, "min": 0.2, "max": 50.0 },
+    "proxy": { "a": -1.0, "b": 1.2, "c": 0.3, "d": 0.6, "sigma_ln": 0.8 }
   }
 }

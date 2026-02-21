@@ -78,10 +78,13 @@ def rotational_fs0_kcrit_eq10(s_seg, z_bathy_seg, z_slip_seg, rho_s, su_ratio, R
         return np.nan, np.nan, np.nan, np.nan, np.nan
 
     t = zb - zs
-    if np.any(~np.isfinite(t)) or np.any(t <= 0):
+    if np.any(~np.isfinite(t)):
         return np.nan, np.nan, np.nan, np.nan, np.nan
 
+    # Use interval-averaged thickness (allows t=0 at endpoints)
     h = 0.5*(t[:-1] + t[1:])
+    if np.any(~np.isfinite(h)) or np.any(h <= 0):
+        return np.nan, np.nan, np.nan, np.nan, np.nan
     dzs = np.diff(zs)
     dl = np.sqrt(ds*ds + dzs*dzs)
     alpha = np.abs(np.arctan2(dzs, ds))
