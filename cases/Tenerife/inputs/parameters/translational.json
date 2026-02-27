@@ -1,0 +1,82 @@
+{
+  "_comment": "Translational slide Monte Carlo parameters. Units: meters (m), seconds (s), kg/m^3, degrees.",
+
+  "d0": {
+    "_comment": "Target initial depth (positive, in meters) used to place the slide: we pick s0 where depth(s0) ~ d0.",
+    "mean": 1200.0,
+    "std": 800.0,
+    "min": 150.0,
+    "max": 2500.0
+  },
+
+  "L": {
+    "_comment": "Slide length along the transect (m). The effective length L_eff may differ slightly due to grid discretization.",
+    "mean": 4000.0,
+    "std": 2000.0,
+    "min": 800.0,
+    "max": 8000.0
+  },
+
+  "T": {
+    "_comment": "Slide thickness T (m). If mode='ratio', sample a thickness ratio tl in [tl_min, tl_max] and set T = tl * L_eff.",
+    "mode": "ratio",
+    "tl_min": 0.01,
+    "tl_max": 0.04,
+    "min_m": 10.0,
+    "max_m": 150.0
+  },
+
+  "phi": {
+    "_comment": "Internal friction angle of the sediment (degrees). Used in FS and kcrit calculations.",
+    "mean": 30.0,
+    "std": 4.0,
+    "min": 28.0,
+    "max": 40.0
+  },
+
+  "rho": {
+    "_comment": "Bulk density of the slide material (kg/m^3). Used with RHO_W to compute the specific gravity ratio s=rho_s/rho_w.",
+    "mean": 1840.0,
+    "std": 80.0,
+    "min": 1400.0,
+    "max": 2500.0
+  },
+
+  "ru": {
+    "_comment": "Choose pore-pressure model: 'direct' or 'grilli'.",
+    "model": "direct",
+    "Rut_max": 0.9,
+    "a": 2.0,
+    "b": 2.0,
+    "eps_t": 0.5,
+    "r_gauss_std": 0.25
+  },
+
+  "width": {
+    "_comment": "Slide width is modeled as w = U(w_min,w_max) * L_eff (so it's proportional to the slide length).",
+    "w_min": 0.40,
+    "w_max": 1.00
+  },
+
+  "hazard": {
+    "_comment": "Return-period ramp used to query k(RP) from the hazard-fit NPZ (PGA/PHA curve). Units: years.",
+    "rp_min": 100.0,
+    "rp_max": 750.0,
+    "rp_step": 10.0,
+    "rp_check_delta": 10.0
+  },
+
+  "failure": {
+    "_comment": "Trigger model. Options: 'kcrit_threshold' or 'newmark_rs2009'",
+    "mode": "kcrit_threshold",
+    "sigma_ln": 0.9,
+
+          "Dcrit_m": {
+            "median": 0.005,
+            "sigma_ln": 0.7,
+            "min": 0.001,
+            "max": 0.3
+          }
+
+  }
+}

@@ -1,0 +1,93 @@
+{
+  "_comment": "Rotational (slump) Monte Carlo parameters. Units: meters (m), seconds (s), kg/m^3, degrees.",
+
+  "d0": {
+    "_comment": "Target initial depth (positive, in meters) used to place the slide start s0: pick s0 where depth(s0) ~ d0.",
+    "mean": 1200.0,
+    "std": 800.0,
+    "min": 150.0,
+    "max": 2500.0
+  },
+
+  "L": {
+    "_comment": "Slide length along the transect (m). Effective length L_eff may differ due to discretization.",
+    "mean": 6000.0,
+    "std": 3000.0,
+    "min": 1200.0,
+    "max": 20000.0
+  },
+
+  "T": {
+    "_comment": "Thickness proxy T (m) used to set sagitta = sagitta_scale*T when building circular arc through endpoints.",
+    "mode": "ratio",
+    "tl_min": 0.015,
+    "tl_max": 0.070,
+    "min_m": 20.0,
+    "max_m": 300.0
+  },
+
+  "rho": {
+    "_comment": "Bulk density of slide material (kg/m^3).",
+    "mean": 1840.0,
+    "std": 80.0,
+    "min": 1400.0,
+    "max": 2500.0
+  },
+
+  "strength": {
+    "_comment": "Undrained strength control (dimensionless). Used by rotational_fs0_kcrit_eq10.",
+    "model": "undrained_ratio",
+    "su_ratio": {
+      "_comment": "Typical undrained strength ratio prior (tune this to make rotational more/less strict).",
+      "mean": 0.20,
+      "std": 0.03,
+      "min": 0.12,
+      "max": 0.30
+    }
+  },
+
+  "ru": {
+    "_comment": "Pore-pressure reduction model for rotational case. Rur is sampled via sample_Rur(beta,...).",
+    "model": "direct",
+    "Rut_max": 0.9,
+    "a": 2.0,
+    "b": 2.0,
+    "eps_t": 0.5,
+    "r_gauss_std": 0.25
+  },
+
+  "width": {
+    "_comment": "Optional but recommended: used to compute failed-slide area/volume in your Step 7 maps.",
+    "w_min": 0.40,
+    "w_max": 1.00
+  },
+
+  "geometry": {
+    "_comment": "Slip-arc construction controls.",
+    "arc_npts": 200,
+    "sagitta_scale": 1.0,
+    "max_attempts_factor": 30
+  },
+
+  "hazard": {
+    "_comment": "Return-period ramp used to query k(RP) from the hazard-fit NPZ. Units: years.",
+    "rp_min": 100.0,
+    "rp_max": 750.0,
+    "rp_step": 10.0,
+    "rp_check_delta": 10.0
+  },
+
+  "failure": {
+    "_comment": "Trigger model. Options: 'kcrit_threshold' or 'newmark_rs2009'.",
+    "mode": "kcrit_threshold",
+    "sigma_ln": 0.9,
+
+    "Dcrit_m": {
+      "_comment": "Only used if mode='newmark_rs2009'. Bounded lognormal displacement capacity (m).",
+      "median": 0.02,
+      "sigma_ln": 0.7,
+      "min": 0.001,
+      "max": 1.0
+    }
+  }
+}

@@ -1,6 +1,45 @@
 #!/usr/bin/env python3
+"""
+4_translational_mc.py
+
+Translational Monte Carlo per transect, triggered by a hazard curve fit.
+
+Inputs
+------
+- config.json must contain:
+    outputs.transects_dir
+    paths.parameters.trans   (path to your translational params JSON)
+
+- params JSON (paths.parameters.trans) must contain:
+    d0, L, T, phi, rho, ru, width, failure
+    hazard: rp_min, rp_max, rp_step, rp_max
+
+
+Run:
+----
+python 4_translational_mc.py --keep-fs-checks --n_trials 10000 --n_jobs 30
+
+
+Hazard fits
+-----------
+This script expects hazard fit NPZ files in:
+    <transects_dir>/hazard_fits/
+
+It will accept either naming/key style:
+- tr_XXXXXX_pha_fit.npz with key "lnpha_coeffs"
+- tr_XXXXXX_pga_fit.npz with key "ln_pga_coeffs"
+
+Outputs
+
+
+Help
+----
+python ../../Python/4_translational_mc.py -h
+
+"""
+
+from importlib.resources import path
 import os
-import sys
 import glob
 import json
 import argparse
@@ -8,246 +47,44 @@ import numpy as np
 import pandas as pd
 from joblib import Parallel, delayed
 
-# -----------------------------
-# Project root on PYTHONPATH
-# -----------------------------
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-if PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT)
-
 from utilities.stats import (
     trunc_normal,
     trunc_lognormal,
     parse_transect_id,
-    find_col,
     beta_from_segment,
 )
 
 from utilities.failure_tools import (
     sample_Rut,
+    sample_Rut_direct,
     kcrit_translational,
-    eta0_translational_eq18,
+    eta0_translational_predictive,
+    newmark_disp_rathje_saygili_2009_m,
+    FS_translational,
+    eval_k_at_s,
+    load_hazard_fit,
+    sample_bounded_lognormal,
+    sample_thickness_T,
+    load_transect,
 )
 
-RHO_W = 1000.0  # consistent with utilities.failure_tools
+RHO_W = 1000.0  # kg/m^3
 
-
-# -----------------------------
-# Defaults (fallback if params missing)
-# -----------------------------
-DEFAULTS = dict(
-    d0=dict(mean=1247.0, std=485.0, min=50.0, max=4000.0),
-    L=dict(mean=5749.0, std=3024.0, min=200.0, max=30000.0),
-    T=dict(mode="ratio", tl_min=0.01, tl_max=0.08, min_m=1.0, max_m=500.0),
-    phi=dict(mean=32.0, std=4.0, min=20.0, max=45.0),
-    rho=dict(mean=1816.6, std=39.9, min=1400.0, max=2200.0),
-    ru=dict(eps_t=0.5, r_gauss_std=0.25),
-    width=dict(w_min=0.20, w_max=0.30),
-    geometry=dict(max_attempts_factor=40),
-
-    # Failure model:
-    #  - kcrit_threshold: failure when k(RP) >= kcrit
-    #  - newmark_rs2009 : failure when D(RP) >= Dcrit, D from Rathje & Saygili (2009) PGA+M regression
-    failure=dict(
-        mode="kcrit_threshold",  # "kcrit_threshold" | "newmark_rs2009"
-        M=dict(dist="normal", mean=7.0, std=0.5, min=6.0, max=8.5),
-        Dcrit_m=dict(dist="lognormal", median=0.8, sigma_ln=0.8, min=0.05, max=20.0),
-        sigma_ln=0.7,
-    ),
-)
 
 OUT_COLS = [
     "transect_id", "trial_id",
     "s0_m", "s1_m",
-    "L_m", "L_eff_m",
-    "d0_m", "beta_deg", "phi_deg", "rho_s",
-    "Rut", "rVt", "rt", "alpha_t", "R_gauss",
-    "FS1", "FS2", "FS0",
-    "kcrit",
+    "L_eff_m", "d0_m",
+    "beta_deg", "phi_deg", "rho_s",
+    "Rut",
+    "FS2", "kcrit",
     "RPmin_yr", "k_RPmin", "failed_within_cap",
-    "RPprev_yr", "k_RPprev",
-    "FS3", "FS4", "RPmin_check_ok",
-    "failure_mode", "M_evt", "Dcrit_m",
-    "D_RPmin_m", "D_RPprev_m", "newmark_eps_ln",
     "T_m", "w_m", "d_center_m", "eta0_m",
-    "failure_type",
 ]
 
 
 # -----------------------------
-# Small helpers
-# -----------------------------
-def _load_json(path):
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-def _resolve_path(p):
-    if p is None:
-        return None
-    return p if os.path.isabs(p) else os.path.abspath(os.path.join(PROJECT_ROOT, p))
-
-def _get(d, keys, default=None):
-    cur = d
-    for k in keys:
-        if not isinstance(cur, dict) or k not in cur:
-            return default
-        cur = cur[k]
-    return cur
-
-def _deep_merge(base, upd):
-    out = dict(base) if isinstance(base, dict) else {}
-    for k, v in (upd or {}).items():
-        if isinstance(v, dict) and isinstance(out.get(k), dict):
-            out[k] = _deep_merge(out[k], v)
-        else:
-            out[k] = v
-    return out
-
-def _merge_defaults(user_params, defaults):
-    return _deep_merge(defaults, user_params or {})
-
-def _load_transect(path):
-    dfT = pd.read_csv(path)
-    s_col = find_col(dfT, ["s_m", "dist_m", "distance_m", "s"])
-    z_col = find_col(dfT, ["depth", "depth_m", "z", "bathy_m"])
-    if s_col is None or z_col is None:
-        raise RuntimeError(
-            f"{os.path.basename(path)} missing s/depth columns. Found: {list(dfT.columns)}"
-        )
-    s_all = dfT[s_col].to_numpy(float)
-    z_all = dfT[z_col].to_numpy(float)  # negative offshore
-    m = np.isfinite(s_all) & np.isfinite(z_all)
-    s_all = s_all[m]
-    z_all = z_all[m]
-    if len(s_all) < 5:
-        return None, None
-    order = np.argsort(s_all)
-    return s_all[order], z_all[order]
-
-def _sample_thickness_T(rng, T_cfg, L_eff):
-    mode = str(T_cfg.get("mode", "ratio")).lower()
-    if mode == "ratio":
-        tl_min = float(T_cfg.get("tl_min", 0.01))
-        tl_max = float(T_cfg.get("tl_max", 0.08))
-        tl = float(rng.uniform(tl_min, tl_max))
-        T = tl * float(L_eff)
-    elif mode == "uniform":
-        mn = float(T_cfg.get("min_m", 1.0))
-        mx = float(T_cfg.get("max_m", 500.0))
-        T = float(rng.uniform(mn, mx))
-    elif mode == "fixed":
-        T = float(T_cfg.get("value_m", 50.0))
-    else:
-        tl = float(rng.uniform(0.01, 0.08))
-        T = tl * float(L_eff)
-
-    if "min_m" in T_cfg:
-        T = max(T, float(T_cfg["min_m"]))
-    if "max_m" in T_cfg:
-        T = min(T, float(T_cfg["max_m"]))
-    return float(T)
-
-def _sample_bounded_lognormal(rng, median, sigma_ln, vmin, vmax, max_tries=80):
-    med = float(median)
-    sig = float(sigma_ln)
-    lo = float(vmin)
-    hi = float(vmax)
-    if not (np.isfinite(med) and med > 0 and np.isfinite(sig) and sig >= 0):
-        return np.nan
-    mu = np.log(med)
-    for _ in range(int(max_tries)):
-        x = float(rng.lognormal(mean=mu, sigma=sig))
-        if np.isfinite(x) and (x >= lo) and (x <= hi):
-            return x
-    x = float(rng.lognormal(mean=mu, sigma=sig))
-    if not np.isfinite(x):
-        return np.nan
-    return float(np.clip(x, lo, hi))
-
-
-# -----------------------------
-# Hazard fit (PHA curve) helpers
-# -----------------------------
-def load_hazard_fit(hazard_dir, tid):
-    f = os.path.join(hazard_dir, f"tr_{int(tid):06d}_pha_fit.npz")
-    if not os.path.exists(f):
-        raise FileNotFoundError(f"Missing hazard fit for transect {tid}: {f}")
-    D = np.load(f)
-    return {
-        "s_m": D["s_m"].astype(float),
-        "lnpha_coeffs": D["lnpha_coeffs"].astype(float),  # (deg+1, n_pts)
-        "deg": int(D["deg"]),
-    }
-
-def eval_k_at_s(hz, s_center_m, rp_years):
-    sgrid = hz["s_m"]
-    C = hz["lnpha_coeffs"]  # (deg+1, n_pts)
-
-    s_center_m = float(np.clip(float(s_center_m), float(sgrid[0]), float(sgrid[-1])))
-
-    c_at_s = np.array([np.interp(s_center_m, sgrid, C[i, :]) for i in range(C.shape[0])], dtype=float)
-
-    rp = np.asarray(rp_years, dtype=float)
-    prob = 1.0 / rp
-    lnpha = np.polyval(c_at_s, prob)
-    k = np.exp(lnpha)
-    k = np.maximum.accumulate(k)  # robust monotonic
-    return k
-
-def FS_translational(beta_deg, phi_deg, rho_s, Rut, k):
-    beta = np.radians(float(beta_deg))
-    phi = np.radians(float(phi_deg))
-    Ru = float(Rut)
-    s = float(rho_s) / RHO_W
-
-    tb = np.tan(beta)
-    tp = np.tan(phi)
-    k = float(k)
-
-    den = ((s - 1.0) * tb + k * s)
-    if not np.isfinite(den) or den == 0.0:
-        return np.nan
-
-    num = ((s - 1.0) * (1.0 - Ru) - k * s * tb)
-    FS = (num / den) * tp
-    return float(FS) if np.isfinite(FS) else np.nan
-
-
-# -----------------------------
-# Newmark displacement model (PGA-only + Magnitude)
-# Rathje & Saygili (2009) regression (as implemented in OpenQuake).
-# PGA_g is in g, same as hazard fit output k
-# critaccel_g is ky in g, here ky = kcrit
-# output in meters
-# -----------------------------
-def newmark_disp_rathje_saygili_2009_m(PGA_g, critaccel_g, M, eps_ln=0.0):
-    PGA_g = np.asarray(PGA_g, dtype=float)
-    crit = float(critaccel_g)
-    M = float(M)
-
-    D = np.zeros_like(PGA_g, dtype=float)
-    m = np.isfinite(PGA_g) & (PGA_g > 0.0) & (PGA_g > crit) & np.isfinite(crit) & (crit > 0.0)
-
-    if not np.any(m):
-        return D
-
-    r = crit / PGA_g[m]  # ky/PGA
-    lnD_cm = (
-        4.89
-        - 4.85 * r
-        - 19.64 * r**2
-        + 42.49 * r**3
-        - 29.06 * r**4
-        + 0.72 * np.log(PGA_g[m])
-        + 0.89 * (M - 6.0)
-        + float(eps_ln)
-    )
-    D[m] = np.exp(lnD_cm) / 100.0  # cm -> m
-    return D
-
-
-# -----------------------------
-# Core MC
+# Monte Carlo run
 # -----------------------------
 def run_trans_mc_for_transect(
     transect_csv,
@@ -258,13 +95,14 @@ def run_trans_mc_for_transect(
     params,
     hazard_dir,
     rp_grid,
-    rp_check_delta,
-    rp_cap,
+    rp_max,
+    magValues=None,
     verbose=False,
 ):
-    tid = parse_transect_id(transect_csv)
+    # --- Identify transect + load profile ---
+    tid = int(parse_transect_id(transect_csv))
+    s_all, z_all = load_transect(transect_csv)
 
-    s_all, z_all = _load_transect(transect_csv)
     out_path = out_fmt.format(tid=tid)
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
 
@@ -272,18 +110,10 @@ def run_trans_mc_for_transect(
         pd.DataFrame([], columns=OUT_COLS).to_csv(out_path, index=False)
         return (tid, 0, 0)
 
+    # --- Hazard (PGA vs RP) ---
     hz = load_hazard_fit(hazard_dir, tid)
 
-    depth_pos_all = -z_all  # positive depth
-    rng = np.random.default_rng(int(seed + tid * 10007))
-
-    out_rows = []
-    attempts = 0
-    max_attempts = int(n_trials * float(params["geometry"].get("max_attempts_factor", 40)))
-
-    s_min = float(s_all[0])
-    s_max = float(s_all[-1])
-
+    # --- Params ---
     d0_cfg = params["d0"]
     L_cfg = params["L"]
     T_cfg = params["T"]
@@ -291,95 +121,120 @@ def run_trans_mc_for_transect(
     rho_cfg = params["rho"]
     ru_cfg = params["ru"]
     w_cfg = params["width"]
+    failure_cfg = params["failure"]
 
-    # failure config
-    failure_cfg = params.get("failure", {}) or {}
-    failure_mode = str(failure_cfg.get("mode", "kcrit_threshold")).lower().strip()
-    if failure_mode in ("newmark", "displacement"):
-        failure_mode = "newmark_rs2009"
+    depth_pos_all = -z_all
 
+    # --- random generator ---
+    rng = np.random.default_rng(int(seed + tid * 10007))
+
+    out_rows = []
+    attempts = 0
+    max_attempts = int(n_trials)
+
+    s_min = float(s_all[0])
+    s_max = float(s_all[-1])
+
+    # --- Failure mode ---
+    failure_mode = failure_cfg["mode"]
     if failure_mode not in ("kcrit_threshold", "newmark_rs2009"):
-        raise RuntimeError(
-            f"Unknown failure.mode='{failure_mode}'. Use 'kcrit_threshold' or 'newmark_rs2009'."
-        )
+        raise RuntimeError(f"Unknown failure.mode='{failure_mode}'")
 
-    Mcfg = failure_cfg.get("M", {}) or {}
+
+    # the following parameters are only used for the newmark_proxy failure mode
+    sigma_ln_rs = float(failure_cfg.get("sigma_ln", 0.7))
     Dcrit_cfg = failure_cfg.get("Dcrit_m", {}) or {}
-    sigma_ln_D = float(failure_cfg.get("sigma_ln", 0.7))
 
-    eps_t = float(ru_cfg.get("eps_t", 0.5))
-    r_gauss_std = float(ru_cfg.get("r_gauss_std", 0.25))
-    w_min = float(w_cfg.get("w_min", 0.20))
-    w_max = float(w_cfg.get("w_max", 0.30))
 
+
+
+    # Ru and width controls
+    eps_t = float(ru_cfg["eps_t"])
+    r_gauss_std = float(ru_cfg["r_gauss_std"])
+    w_min = float(w_cfg["w_min"])
+    w_max = float(w_cfg["w_max"])
+
+    # --- Clean RP grid ---
     rp_grid = np.asarray(rp_grid, dtype=float)
-    rp_grid = rp_grid[np.isfinite(rp_grid) & (rp_grid > 0.0)]
     rp_grid = np.unique(rp_grid)
-
-    if np.isfinite(rp_cap) and rp_cap > 0:
-        rp_grid = rp_grid[rp_grid <= float(rp_cap)]
     if rp_grid.size == 0:
-        raise RuntimeError("RP grid is empty after filtering/capping. Check rp_min/rp_max/rp_step/rp_cap.")
+        raise RuntimeError("RP grid is empty.")
+    rp0 = float(rp_grid[0])
 
+    # =========================
+    # Monte Carlo accept/reject
+    # =========================
     while (len(out_rows) < n_trials) and (attempts < max_attempts):
         attempts += 1
 
-        # priors
-        d0 = trunc_lognormal(
-            rng, float(d0_cfg["mean"]), float(d0_cfg["std"]), float(d0_cfg["min"]), float(d0_cfg["max"])
-        )
-        L = trunc_lognormal(
-            rng, float(L_cfg["mean"]), float(L_cfg["std"]), float(L_cfg["min"]), float(L_cfg["max"])
-        )
-        phi_deg = trunc_normal(
-            rng, float(phi_cfg["mean"]), float(phi_cfg["std"]), float(phi_cfg["min"]), float(phi_cfg["max"])
-        )
-        rho_s = trunc_normal(
-            rng, float(rho_cfg["mean"]), float(rho_cfg["std"]), float(rho_cfg["min"]), float(rho_cfg["max"])
-        )
+        # --- Sample random slide parameters ---
+        d0 = trunc_lognormal(rng, d0_cfg["mean"], d0_cfg["std"], d0_cfg["min"], d0_cfg["max"])
+        L = trunc_lognormal(rng, L_cfg["mean"], L_cfg["std"], L_cfg["min"], L_cfg["max"])
+        phi_deg = trunc_normal(rng, phi_cfg["mean"], phi_cfg["std"], phi_cfg["min"], phi_cfg["max"])
+        rho_s = trunc_normal(rng, rho_cfg["mean"], rho_cfg["std"], rho_cfg["min"], rho_cfg["max"])
 
-        # place slide: s0 + L <= s_max
+        # --- Choose slide location along transect ---
         max_s0 = s_max - L
         if max_s0 <= s_min:
             continue
 
+        # candidates for s0 start anywhere from s_min to s_max-L
         cand = np.where(s_all <= max_s0)[0]
         if cand.size < 5:
             continue
 
+        # pick s0 where depth is closest to d0
         i0 = int(cand[np.argmin(np.abs(depth_pos_all[cand] - d0))])
         s0 = float(s_all[i0])
 
-        s1_target = s0 + L
-        i1 = int(np.searchsorted(s_all, s1_target, side="left"))
+        # end index for s0+L
+        i1 = int(np.searchsorted(s_all, s0 + L, side="left"))
         if i1 <= i0 + 2 or i1 >= len(s_all):
             continue
 
+        # effective length m (the one that is actually used)
         s1 = float(s_all[i1])
         L_eff = float(s1 - s0)
         if L_eff <= 0.0:
             continue
 
+        # segment arrays
         s_seg = s_all[i0:i1 + 1]
-        zb_seg = z_all[i0:i1 + 1]  # negative
-        depth_pos_seg = -zb_seg
+        zb_seg = z_all[i0:i1 + 1]          # (negative depth)
+        depth_pos_seg = -zb_seg            # positive depth
 
+        # --- Local slope beta ---
         beta_deg = beta_from_segment(s_seg, depth_pos_seg)
         if not np.isfinite(beta_deg) or beta_deg <= 0.0:
             continue
 
-        # thickness
-        T = _sample_thickness_T(rng, T_cfg, L_eff)
+        # --- Thickness ---
+        T = sample_thickness_T(rng, T_cfg, L_eff)
 
-        # Ru sampling
-        Rut, rVt, rt, alpha_t, Rgauss = sample_Rut(
-            beta_deg=beta_deg, phi_deg=phi_deg, rng=rng, eps_t=eps_t, r_gauss_std=r_gauss_std
-        )
+        # --- Ru sampling ---
+        ru_model = ru_cfg["model"]
 
-        # FS checks (Grilli stage 1–2)
+        if ru_model == "grilli":
+            Rut, rVt, rt, alpha_t, Rgauss = sample_Rut(
+                beta_deg=beta_deg, phi_deg=phi_deg, rng=rng,
+                eps_t=ru_cfg["eps_t"], r_gauss_std=ru_cfg["r_gauss_std"],
+            )
+        elif ru_model == "direct":
+            Rut = sample_Rut_direct(
+                rng,
+                Rut_max=ru_cfg.get("Rut_max", 0.8),
+                a=ru_cfg.get("a", 2.0),
+                b=ru_cfg.get("b", 2.0),
+            )
+
+        else:
+            raise ValueError(f"Unknown ru.model='{ru_model}'")
+
+
+        # --- Quick FS checks ---
         tb = np.tan(np.radians(beta_deg))
         tp = np.tan(np.radians(phi_deg))
-        if tb <= 0.0 or not np.isfinite(tb) or not np.isfinite(tp):
+        if tb <= 0.0 or (not np.isfinite(tb)) or (not np.isfinite(tp)):
             continue
 
         FS1 = tp / tb
@@ -387,188 +242,138 @@ def run_trans_mc_for_transect(
         if keep_fs_checks and ((FS1 <= 1.0) or (FS2 <= 1.0)):
             continue
 
-        # kcrit
-        kcrit, FS0 = kcrit_translational(beta_deg, phi_deg, rho_s, Rut)
-        if not np.isfinite(kcrit) or not np.isfinite(FS0):
-            continue
+        # --- kcrit  ---
+        kcrit = kcrit_translational(beta_deg, phi_deg, rho_s, Rut)
 
-        # center and depth
+
+        # --- Center depth ---
         s_center = 0.5 * (s0 + s1)
-        zb_center = float(np.interp(s_center, s_seg, zb_seg))
-        d_center = float(max(1.0, -zb_center))
+        zb_center = np.interp(s_center, s_seg, zb_seg)
+        d_center = -zb_center
 
-        # width
-        w_coeff = float(rng.uniform(w_min, w_max))
-        w = w_coeff * L_eff
+        # --- Width ---
+        w = float(rng.uniform(w_min, w_max)) * L_eff
 
-        # eta0
-        eta0 = eta0_translational_eq18(
-            beta_deg=beta_deg, T=T, l=L_eff, d=d_center, rho_s=rho_s, w=w
-        )
+        # --- Tsunami proxy eta0 ---
+        eta0 = eta0_translational_predictive(beta_deg, T, L_eff, d_center, rho_s, w, RHO_W)
         if not np.isfinite(eta0):
             continue
 
-        # hazard k(RP)
+        # --- Hazard k(RP) at slide center for each RP ---
         k_series = eval_k_at_s(hz, s_center, rp_grid)
 
-        # outputs init
-        FS3 = np.nan
-        FS4 = np.nan
-        RPprev = np.nan
-        k_RPprev = np.nan
+        # init outputs
+        # defaults 
+        RPmin = np.nan # minimum return period (yr) at which failure occur
+        k_RPmin = np.nan # hazard k at RPmin
+        failed_within_cap = 0 # flag for whether failure occurs within the RP grid (1) or not (0)
 
-        M_evt = np.nan
-        Dcrit_m = np.nan
-        D_RPmin = np.nan
-        D_RPprev = np.nan
-        newmark_eps_ln = np.nan
+        # --- Newmark-only fields (remain NaN if failure_mode = 'kcrit_threshold') ---
+        M_evt = np.nan          # Earthquake magnitude sampled for this trial (used in Rathje & Saygili 2009 model)
+        Td_s = np.nan           # Shaking duration (s), used only in the proxy Newmark model
+        Dcrit_m = np.nan        # Critical permanent displacement capacity (m) for failure
+        D_RPmin = np.nan        # Predicted Newmark displacement at RPmin (m)
+        D_RPprev = np.nan       # Predicted Newmark displacement at RPprev (m)
+        newmark_eps_ln = np.nan # Lognormal residual term (epsilon) added to ln(D) in the Newmark regression
 
-        # Trigger model
-        if not np.isfinite(kcrit) or kcrit <= 0.0:
-            RPmin = 0.0
-            k_RPmin = 0.0
-            failed_within_cap = 1
-            RPmin_check_ok = np.nan
-            FS3 = FS_translational(beta_deg, phi_deg, rho_s, Rut, 0.0)
-            FS4 = FS3
+        # =====================
+        # Trigger / Failure step
+        # =====================
+        # Inputs already computed for this trial:
+        #   - rp_grid   : array of return periods (years), e.g. [100,110,...,750]
+        #   - k_series  : hazard shaking level at slide center for each RP (PGA in g units)
+        #   - kcrit     : yield/critical acceleration (in g units) from slope+material+pore pressure
+        #
+        # Goal of this block:
+        #   - decide if/when the slide fails as RP increases
+        #   - output the first RP on the ramp that triggers failure (RPmin)
+        #   - store the corresponding hazard level k_RPmin (and displacement D_RPmin for Newmark)
+        #
+        # two trigger models:
+        #   (A) newmark_rs2009 : displacement-based Newmark using Rathje & Saygili (2009) regression
+        #   (B) kcrit_threshold: simple pseudo-static threshold (PGA >= kcrit)
+
+        if failure_mode == "newmark_rs2009":
+
+            # --- Sample event-specific random variables for this trial ---
+            # M_evt     : earthquake magnitude for this trial (taken from openQuake)
+            # Dcrit_m   : displacement capacity (how much permanent displacement causes failure)
+            # eps_ln    : regression residual (log-space noise) for Newmark displacement model
+            if magValues is None or len(magValues) == 0:
+                raise RuntimeError("failure.mode=newmark_rs2009 requires magnitude.csv to be filled")
+            M_evt = float(rng.choice(magValues))
+
+            Dcrit_m = sample_bounded_lognormal(rng, Dcrit_cfg["median"], Dcrit_cfg["sigma_ln"],
+                                            Dcrit_cfg["min"], Dcrit_cfg["max"])
+            newmark_eps_ln = float(rng.normal(0.0, max(0.0, sigma_ln_rs)))
+
+            # --- Compute predicted Newmark permanent displacement D for each RP ---
+            # D_series[j] = D(PGA=k_series[j], ky=kcrit, M=M_evt, eps=newmark_eps_ln)
+            D_series = newmark_disp_rathje_saygili_2009_m(
+                k_series, kcrit, M_evt, newmark_eps_ln
+            )
+
+            # Enforce that D does not decrease as RP increases 
+            D_series = np.maximum.accumulate(D_series)
+
+            # --- Find the first RP where displacement exceeds capacity (failure) ---
+            hit = np.where(D_series >= Dcrit_m)[0]
+            if hit.size > 0:
+                jmin = int(hit[0])                 # first index crossing threshold
+                RPmin = float(rp_grid[jmin])       # first RP that triggers failure
+                k_RPmin = float(k_series[jmin])    # PGA at that RP
+                D_RPmin = float(D_series[jmin])    # displacement at that RP
+                failed_within_cap = 1              # failure occurred somewhere on the RP ladder
+
 
         else:
-            if failure_mode == "newmark_rs2009":
-                # magnitude
-                if str(Mcfg.get("dist", "normal")).lower() != "normal":
-                    raise RuntimeError("failure.M currently supports only dist='normal'.")
+            # --- Simple pseudo-static trigger ---
+            # Failure happens as soon as PGA at the slide center exceeds the yield threshold kcrit:
+            #   k_series[j] >= kcrit
+            hit = np.where(k_series >= kcrit)[0]
+            if hit.size > 0:
+                jmin = int(hit[0])
+                RPmin = float(rp_grid[jmin])
+                k_RPmin = float(k_series[jmin])
+                failed_within_cap = 1
 
-                M_evt = trunc_normal(
-                    rng,
-                    float(Mcfg.get("mean", 7.0)),
-                    float(Mcfg.get("std", 0.5)),
-                    float(Mcfg.get("min", 6.0)),
-                    float(Mcfg.get("max", 8.5)),
-                )
-
-                # capacity
-                if str(Dcrit_cfg.get("dist", "lognormal")).lower() != "lognormal":
-                    raise RuntimeError("failure.Dcrit_m currently supports only dist='lognormal'.")
-
-                Dcrit_m = _sample_bounded_lognormal(
-                    rng,
-                    median=float(Dcrit_cfg.get("median", 0.8)),
-                    sigma_ln=float(Dcrit_cfg.get("sigma_ln", 0.8)),
-                    vmin=float(Dcrit_cfg.get("min", 0.05)),
-                    vmax=float(Dcrit_cfg.get("max", 20.0)),
-                )
-
-                # residual (one per trial)
-                newmark_eps_ln = float(rng.normal(loc=0.0, scale=max(0.0, sigma_ln_D)))
-
-                D_series = newmark_disp_rathje_saygili_2009_m(
-                    PGA_g=k_series, critaccel_g=float(kcrit), M=float(M_evt), eps_ln=newmark_eps_ln
-                )
-                D_series = np.maximum.accumulate(D_series)
-
-                hit = np.where(D_series >= Dcrit_m)[0]
-                if hit.size == 0:
-                    RPmin = np.nan
-                    k_RPmin = np.nan
-                    failed_within_cap = 0
-                    RPmin_check_ok = np.nan
-                else:
-                    jmin = int(hit[0])
-                    RPmin = float(rp_grid[jmin])
-                    k_RPmin = float(k_series[jmin])
-                    D_RPmin = float(D_series[jmin])
-                    failed_within_cap = 1
-
-                    RPprev = float(max(1.0, RPmin - float(rp_check_delta)))
-                    k_RPprev = float(eval_k_at_s(hz, s_center, np.array([RPprev], float))[0])
-
-                    D_RPprev = float(newmark_disp_rathje_saygili_2009_m(
-                        PGA_g=np.array([k_RPprev], float),
-                        critaccel_g=float(kcrit),
-                        M=float(M_evt),
-                        eps_ln=newmark_eps_ln
-                    )[0])
-
-                    FS3 = FS_translational(beta_deg, phi_deg, rho_s, Rut, k_RPmin)
-                    FS4 = FS_translational(beta_deg, phi_deg, rho_s, Rut, k_RPprev)
-
-                    RPmin_check_ok = 1 if (np.isfinite(D_RPprev) and (D_RPprev < Dcrit_m)) else 0
-
-            else:
-                # kcrit threshold mode
-                hit = np.where(k_series >= kcrit)[0]
-                if hit.size == 0:
-                    RPmin = np.nan
-                    k_RPmin = np.nan
-                    failed_within_cap = 0
-                    RPmin_check_ok = np.nan
-                else:
-                    jmin = int(hit[0])
-                    RPmin = float(rp_grid[jmin])
-                    k_RPmin = float(k_series[jmin])
-                    failed_within_cap = 1
-
-                    RPprev = float(max(1.0, RPmin - float(rp_check_delta)))
-                    k_RPprev = float(eval_k_at_s(hz, s_center, np.array([RPprev], float))[0])
-
-                    FS3 = FS_translational(beta_deg, phi_deg, rho_s, Rut, k_RPmin)
-                    FS4 = FS_translational(beta_deg, phi_deg, rho_s, Rut, k_RPprev)
-
-                    RPmin_check_ok = 1 if (np.isfinite(FS4) and FS4 > 1.0) else 0
-
+    # --- Save row ---
         out_rows.append({
+            # IDs
             "transect_id": int(tid),
             "trial_id": int(len(out_rows)),
 
-            "s0_m": float(s0),
-            "s1_m": float(s1),
+            # Geometry / placement
+            "s0_m": round(s0,0),
+            "s1_m": round(s1,0 ),
+            "L_eff_m": round(L_eff,1),
+            "d0_m": round(d0,1),
+            "beta_deg": round(beta_deg,2),
 
-            "L_m": float(L_eff),
-            "L_eff_m": float(L_eff),
+            # Material
+            "phi_deg": round(phi_deg,2),
+            "rho_s": round(rho_s,1),
 
-            "d0_m": float(d0),
-            "beta_deg": float(beta_deg),
-            "phi_deg": float(phi_deg),
-            "rho_s": float(rho_s),
+            # Pore pressure weakening (the only essential one)
+            "Rut": round(Rut,3),
 
-            "Rut": float(Rut),
-            "rVt": float(rVt),
-            "rt": float(rt),
-            "alpha_t": float(alpha_t),
-            "R_gauss": float(Rgauss),
+            # Stability + trigger
+            "FS2": round(FS2,2),
+            "kcrit": round(kcrit,6),
 
-            "FS1": float(FS1),
-            "FS2": float(FS2),
-            "FS0": float(FS0),
-
-            "kcrit": float(kcrit),
-
-            "RPmin_yr": float(RPmin) if np.isfinite(RPmin) else np.nan,
-            "k_RPmin": float(k_RPmin) if np.isfinite(k_RPmin) else np.nan,
+            "RPmin_yr": int(RPmin) if np.isfinite(RPmin) else np.nan,
+            "k_RPmin": round(k_RPmin,6) if np.isfinite(k_RPmin) else np.nan,
             "failed_within_cap": int(failed_within_cap),
 
-            "RPprev_yr": float(RPprev) if np.isfinite(RPprev) else np.nan,
-            "k_RPprev": float(k_RPprev) if np.isfinite(k_RPprev) else np.nan,
 
-            "FS3": float(FS3) if np.isfinite(FS3) else np.nan,
-            "FS4": float(FS4) if np.isfinite(FS4) else np.nan,
-            "RPmin_check_ok": float(RPmin_check_ok) if np.isfinite(RPmin_check_ok) else np.nan,
+            # Tsunami source proxy
+            "T_m": round(T,1),
+            "w_m": round(w,1),
+            "d_center_m": round(d_center,1),
+            "eta0_m": round(eta0,3),
 
-            "failure_mode": str(failure_mode),
-            "M_evt": float(M_evt) if np.isfinite(M_evt) else np.nan,
-            "Dcrit_m": float(Dcrit_m) if np.isfinite(Dcrit_m) else np.nan,
-            "D_RPmin_m": float(D_RPmin) if np.isfinite(D_RPmin) else np.nan,
-            "D_RPprev_m": float(D_RPprev) if np.isfinite(D_RPprev) else np.nan,
-            "newmark_eps_ln": float(newmark_eps_ln) if np.isfinite(newmark_eps_ln) else np.nan,
-
-            "T_m": float(T),
-            "w_m": float(w),
-            "d_center_m": float(d_center),
-            "eta0_m": float(eta0),
-
-            "failure_type": "trans",
         })
-
+    # --- Write output ---
     out = pd.DataFrame(out_rows, columns=OUT_COLS)
     out.to_csv(out_path, index=False)
 
@@ -582,120 +387,89 @@ def run_trans_mc_for_transect(
 # Main
 # -----------------------------
 def main():
-    ap = argparse.ArgumentParser(
-        description="Translational Monte Carlo per transect (Grilli) with hazard triggering via RP ladder.\n"
-                    "Failure modes:\n"
-                    "  - kcrit_threshold: fail when k(RP) >= kcrit (classic)\n"
-                    "  - newmark_rs2009 : fail when D(RP) >= Dcrit, with D from Rathje & Saygili (2009) PGA+M\n"
-    )
-    ap.add_argument("--config", required=True, help="Path to cases/config.json")
-
-    ap.add_argument("--transects-dir", default=None)
-    ap.add_argument("--params", default=None)
-    ap.add_argument("--pattern", default=None)
-    ap.add_argument("--out-fmt", default=None)
-
-    ap.add_argument("--hazard-dir", default=None)
-
+    ap = argparse.ArgumentParser(description="Translational Monte Carlo per transect (hazard-triggered).")
+    ap.add_argument("--config", default="config.json", help="Path to case config.json")
     ap.add_argument("--n-trials", type=int, default=5000)
     ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--keep-fs-checks", action="store_true")
-
-    ap.add_argument("--rp-min", type=float, default=None)
-    ap.add_argument("--rp-max", type=float, default=None)
-    ap.add_argument("--rp-step", type=float, default=None)
-    ap.add_argument("--rp-cap", type=float, default=None)
-    ap.add_argument("--rp-check-delta", type=float, default=10.0)
-
     ap.add_argument("--n-jobs", type=int, default=1)
-    ap.add_argument("--backend", type=str, default="loky",
-                    choices=["loky", "multiprocessing", "threading"])
+    ap.add_argument("--backend", type=str, default="loky", choices=["loky", "multiprocessing", "threading"])
     ap.add_argument("--verbose", action="store_true")
-
     args = ap.parse_args()
 
-    cfg_path = _resolve_path(args.config)
-    cfg = _load_json(cfg_path)
 
-    transects_dir = args.transects_dir
-    if transects_dir is None:
-        transects_dir = _get(cfg, ["outputs", "transects_dir"], "transects")
-    transects_dir = _resolve_path(transects_dir)
-    os.makedirs(transects_dir, exist_ok=True)
+    # Load config, transects and parameters
+    # Read case config
+    if not os.path.exists(args.config):
+        raise SystemExit(f"[FAIL] config not found: {args.config}")
 
-    hazard_dir = args.hazard_dir
-    if hazard_dir is None:
-        hazard_dir = _get(cfg, ["outputs", "hazard_dir"], os.path.join(transects_dir, "hazard_fits"))
-    hazard_dir = _resolve_path(hazard_dir)
+    with open(args.config, "r") as f:
+        cfg = json.load(f)
+
+    transects_dir = cfg["outputs"]["transects_dir"]
+
+    hazard_dir = transects_dir + "/hazard_fits"
     if not os.path.isdir(hazard_dir):
-        raise SystemExit(f"Missing hazard_dir: {hazard_dir}")
+        raise SystemExit(f"[FAIL] Missing hazard_dir: {hazard_dir}")
 
-    params_path = args.params
-    if params_path is None:
-        params_path = _get(cfg, ["paths", "parameters", "trans"], None)
-    if params_path is None:
-        raise SystemExit("Config missing paths.parameters.trans (and you didn't pass --params).")
-    params_path = _resolve_path(params_path)
+    params_path = cfg["paths"]["parameters"]["trans"]
+    with open(params_path, "r") as f:
+        params = json.load(f)
 
-    user_params = _load_json(params_path)
-    params = _merge_defaults(user_params, DEFAULTS)
+    # --- Failure mode ---
+    failure_cfg = params["failure"]
+    failure_mode = failure_cfg["mode"]
 
-    out_fmt = args.out_fmt
-    if out_fmt is None:
-        out_fmt = os.path.join(transects_dir, "tr_{tid:04d}_grilli_mcs.csv")
+    if failure_mode == "newmark_rs2009":
+        mag_path = cfg["paths"]["parameters"]["magnitude_csv"]
+        if not os.path.exists(mag_path):
+                raise SystemExit(f"[FAIL] Missing magnitude CSV: {mag_path}")
+        df_M = pd.read_csv(mag_path)
+        magValues = pd.to_numeric(df_M["M_evt"], errors="coerce").to_numpy(dtype=float)
+    else:
+        magValues = None
 
-    pattern = args.pattern if args.pattern else os.path.join(transects_dir, "tr_*.csv")
-    files = sorted(glob.glob(pattern))
-
-    clean = []
-    for f in files:
-        b = os.path.basename(f)
-        if b == "index.csv":
-            continue
-        if "_mcs" in b:
-            continue
-        if "transects_over" in b:
-            continue
-        clean.append(f)
-    files = clean
-
-    if not files:
-        raise SystemExit(f"No transect CSV files found for pattern: {pattern}")
-
-    rp_min = float(args.rp_min) if args.rp_min is not None else float(_get(cfg, ["pga_loading", "rp_min"], 50.0))
-    rp_max = float(args.rp_max) if args.rp_max is not None else float(_get(cfg, ["pga_loading", "rp_max"], 750.0))
-    rp_step = float(args.rp_step) if args.rp_step is not None else float(_get(cfg, ["pga_loading", "rp_step"], 10.0))
-    rp_cap = float(args.rp_cap) if args.rp_cap is not None else float(_get(cfg, ["pga_loading", "rp_cap"], rp_max))
+    hz_cfg = params["hazard"]
+    rp_min = float(hz_cfg["rp_min"])
+    rp_max = float(hz_cfg["rp_max"])
+    rp_step = float(hz_cfg["rp_step"])
 
     if not (np.isfinite(rp_min) and np.isfinite(rp_max) and np.isfinite(rp_step) and rp_step > 0 and rp_max >= rp_min):
-        raise SystemExit(f"Bad RP ladder params: rp_min={rp_min}, rp_max={rp_max}, rp_step={rp_step}")
+        raise SystemExit(f"[FAIL] Bad RP ramp: rp_min={rp_min} rp_max={rp_max} rp_step={rp_step}")
 
     rp_grid = np.arange(rp_min, rp_max + 0.5 * rp_step, rp_step, dtype=float)
 
-    fm = str((params.get("failure", {}) or {}).get("mode", "kcrit_threshold"))
-    print(f"[INFO] translational MC: {len(files)} transects, n_trials={args.n_trials}, n_jobs={args.n_jobs}, backend={args.backend}")
-    print("[INFO] using params:", params_path)
+    out_fmt = transects_dir + "/tr_{tid:04d}_trans_mcs.csv"
+
+    files = sorted(glob.glob(transects_dir + "/tr_*.csv"))
+
+    #we only take the transect CSV files, skip index.csv and any existing MC outputs
+    files = [
+        f for f in files
+        if os.path.basename(f) != "index.csv"
+        and "_mcs" not in os.path.basename(f)
+        and "transects_over" not in os.path.basename(f)
+    ]
+    if not files:
+        raise SystemExit(f"[FAIL] No transect CSV files found in: {transects_dir}")
+    
+
+    # Print info on the translational MC run
+    fm = str(params["failure"]["mode"])
+    print(f"[INFO] translational MC: {len(files)} transects")
+    print(f"[INFO] n_trials={args.n_trials}  n_jobs={args.n_jobs}  backend={args.backend}")
+    print("[INFO] params:", params_path)
     print("[INFO] hazard_dir:", hazard_dir)
-    print(f"[INFO] RP ladder: min={rp_min} max={rp_max} step={rp_step} cap={rp_cap} (years), check_delta={args.rp_check_delta}yr")
+    print(f"[INFO] RP rump: min={rp_min} max={rp_max} step={rp_step}")
     print("[INFO] keep_fs_checks:", bool(args.keep_fs_checks))
     print("[INFO] failure.mode:", fm)
-    print("[INFO] outputs ->", out_fmt)
 
     if args.n_jobs == 1:
         tot = 0
         for f in files:
             _, nacc, _ = run_trans_mc_for_transect(
-                f,
-                n_trials=args.n_trials,
-                seed=args.seed,
-                keep_fs_checks=args.keep_fs_checks,
-                out_fmt=out_fmt,
-                params=params,
-                hazard_dir=hazard_dir,
-                rp_grid=rp_grid,
-                rp_check_delta=args.rp_check_delta,
-                rp_cap=rp_cap,
-                verbose=True
+                f, args.n_trials, args.seed, args.keep_fs_checks, out_fmt,
+                params, hazard_dir, rp_grid, rp_max, magValues, verbose=True
             )
             tot += nacc
         print("[DONE] total accepted trials written:", tot)
@@ -703,21 +477,11 @@ def main():
 
     results = Parallel(n_jobs=args.n_jobs, backend=args.backend, verbose=10)(
         delayed(run_trans_mc_for_transect)(
-            f,
-            n_trials=args.n_trials,
-            seed=args.seed,
-            keep_fs_checks=args.keep_fs_checks,
-            out_fmt=out_fmt,
-            params=params,
-            hazard_dir=hazard_dir,
-            rp_grid=rp_grid,
-            rp_check_delta=args.rp_check_delta,
-            rp_cap=rp_cap,
-            verbose=args.verbose
+            f, args.n_trials, args.seed, args.keep_fs_checks, out_fmt,
+            params, hazard_dir, rp_grid, rp_max, magValues, args.verbose
         )
         for f in files
     )
-
     tot = int(sum(nacc for (_, nacc, _) in results))
     print("[DONE] total accepted trials written:", tot)
 

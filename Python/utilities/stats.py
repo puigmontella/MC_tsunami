@@ -12,7 +12,45 @@ def quantile_safe(a, p):
         return np.nan
     return float(np.quantile(a, p))
 
+def weighted_percentile(R, w, q):
+    """
+    Weighted percentile of R with weights w.
 
+    Parameters
+    ----------
+    R : array-like
+        Values.
+    w : array-like
+        Non-negative weights (only w>0 are kept).
+    q : float
+        Percentile in [0, 100].
+
+    Returns
+    -------
+    float
+        Weighted percentile value (np.nan if no valid data).
+    """
+    R = np.asarray(R, float)
+    w = np.asarray(w, float)
+
+    m = np.isfinite(R) & np.isfinite(w) & (w > 0.0)
+    if not np.any(m):
+        return np.nan
+
+    Rm = R[m]
+    wm = w[m]
+
+    # sort by R
+    idx = np.argsort(Rm)
+    Rm = Rm[idx]
+    wm = wm[idx]
+
+    # normalized cumulative weights
+    cw = np.cumsum(wm)
+    cw /= cw[-1]
+
+    # interpolate percentile position
+    return float(np.interp(float(q) / 100.0, cw, Rm))
 
 def _valid_mask(*arrs):
     m = None
@@ -105,11 +143,6 @@ def parse_transect_id(path):
         raise ValueError("Could not parse transect id from filename: {}".format(base))
     return int(m.group(1))
 
-def find_col(df, candidates):
-    for c in candidates:
-        if c in df.columns:
-            return c
-    return None
 
 def beta_from_segment(s_seg, depth_pos_seg):
     s = np.asarray(s_seg, float)

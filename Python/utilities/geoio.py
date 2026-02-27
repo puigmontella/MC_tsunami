@@ -36,7 +36,22 @@ def sample_band_at_xy(src, xs, ys, band=1, masked=True):
     return out
 
 
+def meters_to_pixels(meters, pixel_size_m, *, force_odd=False):
+    """
+    Convert a length in meters to a number of pixels using the raster pixel size.
 
+    Example:
+      dx = 10 m/px, want a 290 m window -> 290/10 = 29 px.
+
+    Why force_odd?
+      A moving window is typically centered on a pixel. An odd window (29, 31, ...)
+      has a unique center pixel; an even window (30, 32, ...) doesn't, and can shift
+      alignment by ~half a pixel depending on implementation.
+    """
+    px = int(round(float(meters) / float(pixel_size_m)))
+    if force_odd and (px % 2 == 0):
+        px += 1
+    return px
 
 def load_raster_band(path, band=1, dtype="float32"):
     """

@@ -1,0 +1,41 @@
+{
+  "paths": {
+    "bathy_tif": "inputs/bathy/bathy.tif",
+    "pga_rasters": {
+      "100":  "inputs/pga/pga_100.tif",
+      "200":  "inputs/pga/pga_200.tif",
+      "475":  "inputs/pga/pga_475.tif",
+      "2475": "inputs/pga/pga_2475.tif"
+    },
+    "coastline": {
+      "source": "file",
+      "shp": "inputs/coastline/contourTenerife.shp",
+      "generated_out": "inputs/coastline/coast_from_bathy.shp"
+    },
+      "parameters": {
+      "trans": "inputs/parameters/translational.json",
+      "rot":   "inputs/parameters/rotational.json",
+      "magnitude_csv": "inputs/parameters/magnitude.csv",
+      "coast_runup": "inputs/parameters/coast_runup.json"
+    }
+  },
+
+  "outputs": {
+    "rasters_dir": "outputs/rasters",
+    "transects_dir": "outputs/transects",
+    "coast_dir": "outputs/coast",
+    "summary_csv": "outputs/summary_eq_center_all_rp.csv",
+    "maps_dir": "outputs/maps"
+  },
+  "transects": {
+    "spacing_m": 4000,
+    "eps_m": 40,
+    "max_len_m": 15000,
+    "ds_m": 10,
+    "depth_limit_m": -3500
+  },
+    "pga_loading": {
+    "k_factor": 1.0,
+    "eta_min_m": 0.1
+  }
+}
