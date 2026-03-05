@@ -25,15 +25,26 @@
     "transects_dir": "outputs/transects",
     "coast_dir": "outputs/coast",
     "summary_csv": "outputs/summary_eq_center_all_rp.csv",
-    "maps_dir": "outputs/maps"
+    "maps_dir": "outputs/maps",
+    "areas_dir": "outputs/areas"
   },
   "transects": {
-    "spacing_m": 4000,
+    "spacing_m": 2000,
     "eps_m": 40,
     "max_len_m": 15000,
     "ds_m": 10,
-    "depth_limit_m": -3500
+    "depth_limit_m": -3000
   },
+"areas": {
+  "tile_m": 10000,
+  "stride_m": 8000,
+  "sample_ds_m": 200,
+  "depth_limit_m": -3000,
+  "min_valid_frac": 0.5,
+
+  "shore_dist_min_m": 0.0,
+  "shore_dist_max_m": 20000.0
+},
     "pga_loading": {
     "k_factor": 1.0,
     "eta_min_m": 0.1

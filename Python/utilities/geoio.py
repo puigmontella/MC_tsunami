@@ -1,6 +1,6 @@
 import numpy as np
 import rasterio
-from rasterio.transform import rowcol
+from rasterio.transform import rowcol, xy
 from scipy.ndimage import gaussian_filter, uniform_filter, distance_transform_edt
 
 def open_raster(path):
@@ -212,3 +212,33 @@ def sample_raster_points(src, xs=None, ys=None, coords=None):
         vals[vals == nd] = np.nan
 
     return vals
+
+
+
+
+
+def tile_bbox_from_indices(transform, row0, col0, nrows, ncols):
+    """
+    Bounding box of a pixel window in map coordinates.
+
+    Args
+    ----
+    transform : rasterio Affine transform
+    row0,col0 : top-left pixel index
+    nrows,ncols : window size in pixels
+
+    Returns
+    -------
+    (xmin, xmax, ymin, ymax) in CRS units (meters for UTM)
+    """
+    # upper-left corner of top-left pixel
+    x_ul, y_ul = xy(transform, row0, col0, offset="ul")
+    # lower-right corner of bottom-right pixel (row0+nrows, col0+ncols)
+    x_lr, y_lr = xy(transform, row0 + nrows, col0 + ncols, offset="lr")
+
+    xmin = float(min(x_ul, x_lr))
+    xmax = float(max(x_ul, x_lr))
+    ymin = float(min(y_ul, y_lr))
+    ymax = float(max(y_ul, y_lr))
+    return xmin, xmax, ymin, ymax
+

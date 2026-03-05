@@ -3,9 +3,9 @@
 
   "d0": {
     "_comment": "Target initial depth (positive, in meters) used to place the slide: we pick s0 where depth(s0) ~ d0.",
-    "mean": 1200.0,
-    "std": 800.0,
-    "min": 150.0,
+    "mean": 1000.0,
+    "std": 500.0,
+    "min": 200.0,
     "max": 2500.0
   },
 
@@ -20,18 +20,18 @@
   "T": {
     "_comment": "Slide thickness T (m). If mode='ratio', sample a thickness ratio tl in [tl_min, tl_max] and set T = tl * L_eff.",
     "mode": "ratio",
-    "tl_min": 0.01,
-    "tl_max": 0.04,
-    "min_m": 10.0,
-    "max_m": 150.0
+    "tl_min": 0.005,
+    "tl_max": 0.012,
+    "min_m": 8.0,
+    "max_m": 80.0
   },
 
   "phi": {
     "_comment": "Internal friction angle of the sediment (degrees). Used in FS and kcrit calculations.",
     "mean": 30.0,
-    "std": 4.0,
-    "min": 28.0,
-    "max": 40.0
+    "std": 5.0,
+    "min": 25.0,
+    "max": 38.0
   },
 
   "rho": {
@@ -44,7 +44,7 @@
 
   "ru": {
     "_comment": "Choose pore-pressure model: 'direct' or 'grilli'.",
-    "model": "direct",
+    "model": "grilli",
     "Rut_max": 0.9,
     "a": 2.0,
     "b": 2.0,
@@ -61,11 +61,17 @@
   "hazard": {
     "_comment": "Return-period ramp used to query k(RP) from the hazard-fit NPZ (PGA/PHA curve). Units: years.",
     "rp_min": 100.0,
-    "rp_max": 750.0,
+    "rp_max": 2500.0,
     "rp_step": 10.0,
     "rp_check_delta": 10.0
   },
-
+  "beta_mode": "mean",
+"placement": {
+  "_comment": "Force both transects+areas to pick the closest depth to d0 (deterministic).",
+  "depth_match_tol_m": 200.0,
+  "min_candidates": 1,
+  "fallback_top_k": 0
+},
   "failure": {
     "_comment": "Trigger model. Options: 'kcrit_threshold' or 'newmark_rs2009'",
     "mode": "kcrit_threshold",

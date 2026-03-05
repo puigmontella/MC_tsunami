@@ -69,6 +69,7 @@ OUT_COLS = [
     "FS0", "kcrit",
     "RPmin_yr", "k_RPmin", "failed_within_cap",
     "T_m", "w_m", "d_center_m", "eta0_m",
+    "V_m3", "d_misfit_m",
     "r_m", "dphi_rad",
 ]
 
@@ -94,7 +95,7 @@ def run_rot_mc_for_transect(
     out_path = out_fmt.format(tid=tid)
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
 
-    if s_all is None:
+    if s_all is None or z_all is None or len(s_all) < 5:
         pd.DataFrame([], columns=OUT_COLS).to_csv(out_path, index=False)
         return (tid, 0, 0)
 
@@ -115,8 +116,13 @@ def run_rot_mc_for_transect(
     w_cfg = params.get("width", None)  # optional, but recommended for Step 7 volumes
     failure_cfg = params["failure"]
 
-    failure_mode = str(failure_cfg["mode"]).lower().strip()
+    # placement optional (matches your translational/areas philosophy)
+    pcfg = params.get("placement", {}) or {}
+    depth_match_tol_m = float(pcfg.get("depth_match_tol_m", 200.0))
+    min_candidates = int(pcfg.get("min_candidates", 1))
+    fallback_top_k = int(pcfg.get("fallback_top_k", 0))
 
+    failure_mode = str(failure_cfg["mode"]).lower().strip()
     if failure_mode not in ("kcrit_threshold", "newmark_rs2009"):
         raise RuntimeError(f"Unknown failure.mode='{failure_mode}'")
 
@@ -141,7 +147,10 @@ def run_rot_mc_for_transect(
     else:
         w_min = w_max = np.nan
 
-    depth_pos_all = -z_all
+    depth_pos_all = -np.asarray(z_all, dtype=float)  # positive depth
+    s_all = np.asarray(s_all, dtype=float)
+    z_all = np.asarray(z_all, dtype=float)
+
     rng = np.random.default_rng(int(seed + tid * 10007))
 
     out_rows = []
@@ -163,17 +172,37 @@ def run_rot_mc_for_transect(
         rho_s = trunc_normal(rng, rho_cfg["mean"], rho_cfg["std"], rho_cfg["min"], rho_cfg["max"])
         su_ratio = trunc_normal(rng, su_cfg["mean"], su_cfg["std"], su_cfg["min"], su_cfg["max"])
 
-        # place slide
+        # place slide: s0 must allow length L
         max_s0 = s_max - L
         if max_s0 <= s_min:
             continue
+
         cand = np.where(s_all <= max_s0)[0]
         if cand.size < 5:
             continue
 
-        i0 = int(cand[np.argmin(np.abs(depth_pos_all[cand] - d0))])
+        # placement with tol / candidates / fallback
+        derr = np.abs(depth_pos_all[cand] - float(d0))
+        tol = min(depth_match_tol_m, 0.35 * float(d0))
+        cand_in_tol = cand[derr <= tol]
+
+        if cand_in_tol.size >= min_candidates:
+            if (min_candidates <= 1) and (fallback_top_k == 0):
+                # deterministic closest (reproducible like your "placement deterministic")
+                i0 = int(cand[np.argmin(derr)])
+            else:
+                i0 = int(rng.choice(cand_in_tol))
+        else:
+            if fallback_top_k and fallback_top_k > 0:
+                k = min(int(fallback_top_k), cand.size)
+                top = cand[np.argpartition(derr, k - 1)[:k]]
+                i0 = int(rng.choice(top))
+            else:
+                i0 = int(cand[np.argmin(derr)])
+
         s0 = float(s_all[i0])
 
+        # endpoint
         i1 = int(np.searchsorted(s_all, s0 + L, side="left"))
         if i1 <= i0 + 2 or i1 >= len(s_all):
             continue
@@ -191,15 +220,14 @@ def run_rot_mc_for_transect(
         z1 = float(zb_seg_real[-1])
         zb_seg = z0 + (s_seg - s0) * (z1 - z0) / max((s1 - s0), 1e-9)
 
-        beta_deg = beta_from_segment(s_seg, -zb_seg)
+        beta_deg = beta_from_segment(s_seg, -zb_seg)  # expects positive depth
         if not np.isfinite(beta_deg) or beta_deg <= 0.0:
             continue
 
-        ru_model = ru_cfg["model"]
+        ru_model = str(ru_cfg["model"]).lower().strip()
 
         if ru_model == "grilli":
             Rur, rr, Rgauss = sample_Rur(beta_deg, rng, eps_r=eps_r, r_gauss_std=r_gauss_std)
-
         elif ru_model == "direct":
             Rur = sample_Rur_direct(
                 rng,
@@ -240,8 +268,7 @@ def run_rot_mc_for_transect(
             continue
 
         # stability
-        FS0, kcrit = kcrit_rotational(s_seg,zb_seg,zs_seg,rho_s,su_ratio,Rur,r_circle)
-
+        FS0, kcrit = kcrit_rotational(s_seg, zb_seg, zs_seg, rho_s, su_ratio, Rur, r_circle)
         if not np.isfinite(FS0) or not np.isfinite(kcrit):
             continue
         if keep_fs_checks and (FS0 <= 1.0):
@@ -251,12 +278,15 @@ def run_rot_mc_for_transect(
         s_center = 0.5 * (s0 + s1)
         zb_center_real = float(np.interp(s_center, s_seg, zb_seg_real))
         d_center = float(max(1.0, -zb_center_real))
+        d_misfit = float(abs(d_center - float(d0)))
 
         # optional width for later volume maps
         if np.isfinite(w_min) and np.isfinite(w_max):
             w = float(rng.uniform(w_min, w_max)) * L_eff
         else:
             w = np.nan
+
+        V_m3 = float(L_eff) * float(w) * float(T) if np.isfinite(w) else np.nan
 
         # eta0 proxy
         eta0 = eta0_rotational_predictive(
@@ -279,11 +309,6 @@ def run_rot_mc_for_transect(
         k_RPmin = np.nan
         failed_within_cap = 0
 
-        M_evt = np.nan
-        Dcrit_m = np.nan
-        D_RPmin = np.nan
-        newmark_eps_ln = np.nan
-
         if failure_mode == "newmark_rs2009":
             if magValues is None or len(magValues) == 0:
                 raise RuntimeError("failure.mode=newmark_rs2009 requires magnitude.csv to be filled")
@@ -304,9 +329,7 @@ def run_rot_mc_for_transect(
                 jmin = int(hit[0])
                 RPmin = float(rp_grid[jmin])
                 k_RPmin = float(k_series[jmin])
-                D_RPmin = float(D_series[jmin])
                 failed_within_cap = 1
-
         else:
             hit = np.where(k_series >= kcrit)[0]
             if hit.size > 0:
@@ -322,7 +345,7 @@ def run_rot_mc_for_transect(
             "s0_m": round(s0, 0),
             "s1_m": round(s1, 0),
             "L_eff_m": round(L_eff, 1),
-            "d0_m": round(d0, 1),
+            "d0_m": round(float(d0), 1),
 
             "beta_deg": round(beta_deg, 2),
             "rho_s": round(rho_s, 1),
@@ -342,9 +365,11 @@ def run_rot_mc_for_transect(
             "d_center_m": round(d_center, 1),
             "eta0_m": round(eta0, 3),
 
+            "V_m3": float(V_m3) if np.isfinite(V_m3) else np.nan,
+            "d_misfit_m": float(d_misfit),
+
             "r_m": round(float(r_circle), 1),
             "dphi_rad": round(float(dphi_use), 6),
-
         })
 
     out = pd.DataFrame(out_rows, columns=OUT_COLS)
@@ -370,8 +395,6 @@ def main():
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
-    # Load config, transects and parameters
-    # Read case config
     if not os.path.exists(args.config):
         raise SystemExit(f"[FAIL] config not found: {args.config}")
 
@@ -380,7 +403,7 @@ def main():
 
     transects_dir = cfg["outputs"]["transects_dir"]
 
-    hazard_dir = transects_dir + "/hazard_fits"
+    hazard_dir = os.path.join(transects_dir, "hazard_fits")
     if not os.path.isdir(hazard_dir):
         raise SystemExit(f"[FAIL] Missing hazard_dir: {hazard_dir}")
 
@@ -390,14 +413,15 @@ def main():
 
     # --- Failure mode ---
     failure_cfg = params["failure"]
-    failure_mode = failure_cfg["mode"]
+    failure_mode = str(failure_cfg["mode"]).lower().strip()
 
     if failure_mode == "newmark_rs2009":
         mag_path = cfg["paths"]["parameters"]["magnitude_csv"]
         if not os.path.exists(mag_path):
-                raise SystemExit(f"[FAIL] Missing magnitude CSV: {mag_path}")
+            raise SystemExit(f"[FAIL] Missing magnitude CSV: {mag_path}")
         df_M = pd.read_csv(mag_path)
         magValues = pd.to_numeric(df_M["M_evt"], errors="coerce").to_numpy(dtype=float)
+        magValues = magValues[np.isfinite(magValues)]
     else:
         magValues = None
 
